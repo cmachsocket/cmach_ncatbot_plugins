@@ -28,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("text", nargs="?", help="直接给的文本（也可用 -f 或 stdin）")
     parser.add_argument("-f", "--file", help="从文件读取（- 表示 stdin）")
-    parser.add_argument("-o", "--out", required=True, help="输出 PNG 路径")
+    parser.add_argument("-o", "--out", required=False, help="输出 PNG 路径")
     parser.add_argument("-t", "--theme", default="modern",
                         choices=list_styles(),
                         help="主题（默认 modern）")
@@ -53,6 +53,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.show_fonts:
         print(describe(cached_fontset()))
         return 0
+
+    if not args.out:
+        print("错误：需要 -o/--out，或者使用 --list-themes / --show-fonts。", file=sys.stderr)
+        sys.exit(2)
 
     text = _read_text(args)
     out = render(
