@@ -4,6 +4,6 @@ main = "jm.py"
 author = "cmach_socket"
 description = "JmComic downloader"
 entry_class = "JmPlugin"
-pip_dependencies = [jmcomic,os,asyncio]
+pip_dependencies = []
 
 [dependencies]
