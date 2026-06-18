@@ -131,6 +131,8 @@ class JmPlugin(NcatBotPlugin):
         if not result[0]:
             await event.reply(text=result[1])
         else:
+            if len(parts) > 2:
+                raise Exception("进入纯文本输出模式了喵～")
             try:
                 img_path = await txt2img(result[1])
                 if not img_path:
