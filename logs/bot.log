@@ -1,0 +1,7 @@
+[2026-06-18 19:26:04.604] INFO     BotClient 'ncatbot/app/client.py:123' ➜ 从配置创建适配器: type=napcat, platform=qq
+[2026-06-18 19:26:04.605] INFO     BotClient 'ncatbot/app/client.py:353' ➜ 正在启动 Adapter: napcat (platform=qq)
+[2026-06-18 19:26:07.510] WARNING  NapCatLauncher 'ncatbot/adapter/napcat/setup/launcher.py:102' ➜ 测试 WebSocket 连接失败: did not receive a valid HTTP response
+[2026-06-18 19:26:16.175] ERROR    NcatBotError 'ncatbot/utils/error.py:15' ➜ 安装或更新 NapCat 失败
+[2026-06-18 19:26:48.953] INFO     BotClient 'ncatbot/app/client.py:123' ➜ 从配置创建适配器: type=napcat, platform=qq
+[2026-06-18 19:26:48.954] INFO     BotClient 'ncatbot/app/client.py:353' ➜ 正在启动 Adapter: napcat (platform=qq)
+[2026-06-18 19:26:51.054] WARNING  NapCatLauncher 'ncatbot/adapter/napcat/setup/launcher.py:102' ➜ 测试 WebSocket 连接失败: did not receive a valid HTTP response
