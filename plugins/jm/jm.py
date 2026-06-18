@@ -1,20 +1,34 @@
 from jmcomic import JmOption, download_album, Feature,JmModuleConfig
 import jmcomic
 import asyncio
+import hashlib
 import os
 
+from jm.text2img import render
 from ncatbot.core import registrar
 from ncatbot.event import HasSender
 from ncatbot.plugin import NcatBotPlugin
 from ncatbot.event.qq import GroupMessageEvent
 
-def get_domain() -> None:
+async def get_domain() -> None:
     domain_list = JmModuleConfig.get_html_domain_all()
     JmModuleConfig.DOMAIN_HTML_LIST = domain_list # type: ignore
 
+async def txt2img(text: str) -> str:
+    try:
+        md5 = hashlib.md5()
+        md5.update(text.encode('utf-8'))
+        md5_digest = md5.hexdigest()
+        out_path = f"/tmp/{md5_digest}.png"
+        if os.path.exists(out_path):
+            return out_path
+        await asyncio.to_thread(render, text, theme="dark", out=out_path)
+        return out_path
+    except Exception as e:
+        return ""
 
 async def comic_download(id: int) -> tuple[bool, str]:
-    get_domain()
+    await get_domain()
     if os.path.exists(f"down/{id}.pdf"):
         return ( True, f"down/{id}.pdf")
     try:
@@ -30,7 +44,7 @@ async def comic_download(id: int) -> tuple[bool, str]:
     else:
         return (False, "呜喵…保存失败了喵…")
 async def comic_detail(id: int) -> tuple[bool, str]:
-    get_domain()
+    await get_domain()
     op = JmOption.default()
     async with op.new_jm_async_client() as cl:
         try:
@@ -117,5 +131,10 @@ class JmPlugin(NcatBotPlugin):
         if not result[0]:
             await event.reply(text=result[1])
         else:
-            await event.reply(text=result[1])
-
+            try:
+                img_path = await txt2img(result[1])
+                if not img_path:
+                    raise Exception("文本转图片失败了喵～")
+                await self.api.qq.send_group_image(event.group_id,img_path)
+            except Exception as e:
+                await event.reply(text=result[1])
