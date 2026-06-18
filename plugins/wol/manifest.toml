@@ -1,0 +1,9 @@
+name = "cmach.qzz.io.wol.plugin"
+version = "0.1.0"
+main = "wol.py"
+author = "cmach_socket"
+description = "Wake on Lan for my laptap"
+entry_class = "WolPlugin"
+pip_dependencies = []
+
+[dependencies]

@@ -337,3 +337,82 @@
 [2026-06-18 19:46:12.945] INFO     TimeTaskService 'ncatbot/service/builtin/schedule/service.py:83' ➜ 定时任务服务已停止
 [2026-06-18 19:46:12.946] INFO     DispatchFilter 'ncatbot/service/builtin/dispatch_filter/service.py:63' ➜ 分发过滤服务已关闭
 [2026-06-18 19:46:12.946] INFO     BotClient 'ncatbot/app/client.py:290' ➜ 已关闭
+[2026-06-18 19:56:28.589] INFO     BotClient 'ncatbot/app/client.py:123' ➜ 从配置创建适配器: type=napcat, platform=qq
+[2026-06-18 19:56:28.589] INFO     BotClient 'ncatbot/app/client.py:353' ➜ 正在启动 Adapter: napcat (platform=qq)
+[2026-06-18 19:56:28.625] INFO     NapCatLauncher 'ncatbot/adapter/napcat/setup/launcher.py:195' ➜ 账号验证通过 (QQ 1639950290)
+[2026-06-18 19:56:28.634] INFO     NapCatWebSocket 'ncatbot/adapter/napcat/connection/websocket.py:47' ➜ WebSocket 已连接
+[2026-06-18 19:56:28.634] INFO     BotAPIClient 'ncatbot/api/client.py:45' ➜ 注册平台 API: misc
+[2026-06-18 19:56:28.635] INFO     BotAPIClient 'ncatbot/api/client.py:45' ➜ 注册平台 API: qq
+[2026-06-18 19:56:28.635] INFO     BotClient 'ncatbot/app/client.py:388' ➜ BotAPIClient 已就绪（平台: ['misc', 'qq']）
+[2026-06-18 19:56:28.635] INFO     BotClient 'ncatbot/app/client.py:320' ➜ 已启动 1 个适配器的事件监听
+[2026-06-18 19:56:28.636] INFO     RBAC 'ncatbot/service/builtin/rbac/service.py:81' ➜ RBAC 数据已从 data/rbac.json 加载
+[2026-06-18 19:56:28.636] INFO     RBAC 'ncatbot/service/builtin/rbac/service.py:86' ➜ RBAC 服务已加载
+[2026-06-18 19:56:28.636] INFO     FileWatcher 'ncatbot/service/builtin/file_watcher/service.py:136' ➜ 已自动监听全局配置文件: /home/cmach_socket/projects/wol/config.yaml
+[2026-06-18 19:56:28.637] INFO     TimeTaskService 'ncatbot/service/builtin/schedule/service.py:71' ➜ 定时任务服务已启动
+[2026-06-18 19:56:28.637] INFO     DispatchFilter 'ncatbot/service/builtin/dispatch_filter/service.py:55' ➜ 分发过滤服务已加载，共 0 条规则
+[2026-06-18 19:56:28.641] INFO     SystemManager 'ncatbot/plugin/builtin/system_manager/main.py:60' ➜ 系统管理插件已加载
+[2026-06-18 19:56:28.641] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:381' ➜ 内置插件加载成功: _system_manager v1.0.0
+[2026-06-18 19:56:28.693] INFO     cmach.qzz.io.jm.plugin 'jm.py:46' ➜ cmach.qzz.io.jm.plugin 已加载
+[2026-06-18 19:56:28.693] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:199' ➜ 插件加载成功: cmach.qzz.io.jm.plugin v0.1.0
+[2026-06-18 19:56:28.694] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:107' ➜ 已加载 1/1 个插件
+[2026-06-18 19:56:28.694] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:308' ➜ 热重载已启动
+[2026-06-18 19:56:28.694] INFO     BotClient 'ncatbot/app/client.py:297' ➜ Bot 已就绪（1 个适配器）
+[2026-06-18 19:56:29.768] INFO     BotClient 'ncatbot/app/client.py:302' ➜ Bot 被取消
+[2026-06-18 19:56:29.769] INFO     BotClient 'ncatbot/app/client.py:240' ➜ 正在关闭…
+[2026-06-18 19:56:29.775] INFO     NapCatWebSocket 'ncatbot/adapter/napcat/connection/websocket.py:55' ➜ WebSocket 连接已关闭
+[2026-06-18 19:56:29.775] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:319' ➜ 热重载已停止
+[2026-06-18 19:56:29.776] INFO     cmach.qzz.io.jm.plugin 'jm.py:49' ➜ cmach.qzz.io.jm.plugin 已卸载
+[2026-06-18 19:56:29.776] INFO     HandlerDispatcher 'ncatbot/core/registry/dispatcher.py:188' ➜ revoke_plugin(cmach.qzz.io.jm.plugin): 移除 3 个 handler
+[2026-06-18 19:56:29.777] INFO     ModuleImporter 'ncatbot/plugin/loader/importer.py:139' ➜ 已卸载模块 cmach.qzz.io.jm.plugin (共 2 个)
+[2026-06-18 19:56:29.777] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:232' ➜ 插件已卸载: cmach.qzz.io.jm.plugin
+[2026-06-18 19:56:29.778] INFO     SystemManager 'ncatbot/plugin/builtin/system_manager/main.py:70' ➜ 系统管理插件已关闭
+[2026-06-18 19:56:29.779] INFO     HandlerDispatcher 'ncatbot/core/registry/dispatcher.py:188' ➜ revoke_plugin(_system_manager): 移除 9 个 handler
+[2026-06-18 19:56:29.779] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:232' ➜ 插件已卸载: _system_manager
+[2026-06-18 19:56:29.779] INFO     RBAC 'ncatbot/service/builtin/rbac/service.py:91' ➜ RBAC 服务已关闭
+[2026-06-18 19:56:29.779] INFO     TimeTaskService 'ncatbot/service/builtin/schedule/service.py:83' ➜ 定时任务服务已停止
+[2026-06-18 19:56:29.779] INFO     DispatchFilter 'ncatbot/service/builtin/dispatch_filter/service.py:63' ➜ 分发过滤服务已关闭
+[2026-06-18 19:56:29.780] INFO     BotClient 'ncatbot/app/client.py:290' ➜ 已关闭
+[2026-06-18 19:57:26.565] INFO     BotClient 'ncatbot/app/client.py:123' ➜ 从配置创建适配器: type=napcat, platform=qq
+[2026-06-18 19:57:26.566] INFO     BotClient 'ncatbot/app/client.py:353' ➜ 正在启动 Adapter: napcat (platform=qq)
+[2026-06-18 19:57:26.710] INFO     NapCatLauncher 'ncatbot/adapter/napcat/setup/launcher.py:195' ➜ 账号验证通过 (QQ 1639950290)
+[2026-06-18 19:57:26.719] INFO     NapCatWebSocket 'ncatbot/adapter/napcat/connection/websocket.py:47' ➜ WebSocket 已连接
+[2026-06-18 19:57:26.719] INFO     BotAPIClient 'ncatbot/api/client.py:45' ➜ 注册平台 API: misc
+[2026-06-18 19:57:26.719] INFO     BotAPIClient 'ncatbot/api/client.py:45' ➜ 注册平台 API: qq
+[2026-06-18 19:57:26.719] INFO     BotClient 'ncatbot/app/client.py:388' ➜ BotAPIClient 已就绪（平台: ['misc', 'qq']）
+[2026-06-18 19:57:26.719] INFO     BotClient 'ncatbot/app/client.py:320' ➜ 已启动 1 个适配器的事件监听
+[2026-06-18 19:57:26.720] INFO     RBAC 'ncatbot/service/builtin/rbac/service.py:81' ➜ RBAC 数据已从 data/rbac.json 加载
+[2026-06-18 19:57:26.720] INFO     RBAC 'ncatbot/service/builtin/rbac/service.py:86' ➜ RBAC 服务已加载
+[2026-06-18 19:57:26.720] INFO     FileWatcher 'ncatbot/service/builtin/file_watcher/service.py:136' ➜ 已自动监听全局配置文件: /home/cmach_socket/projects/wol/config.yaml
+[2026-06-18 19:57:26.720] INFO     TimeTaskService 'ncatbot/service/builtin/schedule/service.py:71' ➜ 定时任务服务已启动
+[2026-06-18 19:57:26.721] INFO     DispatchFilter 'ncatbot/service/builtin/dispatch_filter/service.py:55' ➜ 分发过滤服务已加载，共 0 条规则
+[2026-06-18 19:57:26.723] INFO     SystemManager 'ncatbot/plugin/builtin/system_manager/main.py:60' ➜ 系统管理插件已加载
+[2026-06-18 19:57:26.723] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:381' ➜ 内置插件加载成功: _system_manager v1.0.0
+[2026-06-18 19:57:26.728] INFO     cmach.qzz.io.wol.plugin 'wol.py:12' ➜ cmach.qzz.io.wol.plugin 已加载
+[2026-06-18 19:57:26.728] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:199' ➜ 插件加载成功: cmach.qzz.io.wol.plugin v0.1.0
+[2026-06-18 19:57:26.768] INFO     cmach.qzz.io.jm.plugin 'jm.py:46' ➜ cmach.qzz.io.jm.plugin 已加载
+[2026-06-18 19:57:26.768] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:199' ➜ 插件加载成功: cmach.qzz.io.jm.plugin v0.1.0
+[2026-06-18 19:57:26.768] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:107' ➜ 已加载 2/2 个插件
+[2026-06-18 19:57:26.768] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:308' ➜ 热重载已启动
+[2026-06-18 19:57:26.768] INFO     BotClient 'ncatbot/app/client.py:297' ➜ Bot 已就绪（1 个适配器）
+[2026-06-18 19:57:37.651] INFO     NapCatAdapter 'ncatbot/adapter/napcat/connection/protocol.py:79' ➜ [私聊消息] Solaris(3077906125): wol
+[2026-06-18 19:57:38.047] INFO     NapCatAdapter 'ncatbot/adapter/napcat/connection/protocol.py:79' ➜ [私聊消息] 8班小助手(1639950290): [CQ:reply,id=1721284648]正在发送唤醒包...
+[2026-06-18 19:57:38.458] INFO     NapCatAdapter 'ncatbot/adapter/napcat/connection/protocol.py:79' ➜ [私聊消息] 8班小助手(1639950290): [CQ:reply,id=1721284648]唤醒包已发送
+[2026-06-18 19:57:44.524] INFO     BotClient 'ncatbot/app/client.py:302' ➜ Bot 被取消
+[2026-06-18 19:57:44.524] INFO     BotClient 'ncatbot/app/client.py:240' ➜ 正在关闭…
+[2026-06-18 19:57:44.529] INFO     NapCatWebSocket 'ncatbot/adapter/napcat/connection/websocket.py:55' ➜ WebSocket 连接已关闭
+[2026-06-18 19:57:44.529] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:319' ➜ 热重载已停止
+[2026-06-18 19:57:44.530] INFO     cmach.qzz.io.wol.plugin 'wol.py:15' ➜ cmach.qzz.io.wol.plugin 已卸载
+[2026-06-18 19:57:44.530] INFO     HandlerDispatcher 'ncatbot/core/registry/dispatcher.py:188' ➜ revoke_plugin(cmach.qzz.io.wol.plugin): 移除 2 个 handler
+[2026-06-18 19:57:44.531] INFO     ModuleImporter 'ncatbot/plugin/loader/importer.py:139' ➜ 已卸载模块 cmach.qzz.io.wol.plugin (共 2 个)
+[2026-06-18 19:57:44.531] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:232' ➜ 插件已卸载: cmach.qzz.io.wol.plugin
+[2026-06-18 19:57:44.531] INFO     cmach.qzz.io.jm.plugin 'jm.py:49' ➜ cmach.qzz.io.jm.plugin 已卸载
+[2026-06-18 19:57:44.532] INFO     HandlerDispatcher 'ncatbot/core/registry/dispatcher.py:188' ➜ revoke_plugin(cmach.qzz.io.jm.plugin): 移除 3 个 handler
+[2026-06-18 19:57:44.532] INFO     ModuleImporter 'ncatbot/plugin/loader/importer.py:139' ➜ 已卸载模块 cmach.qzz.io.jm.plugin (共 2 个)
+[2026-06-18 19:57:44.532] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:232' ➜ 插件已卸载: cmach.qzz.io.jm.plugin
+[2026-06-18 19:57:44.532] INFO     SystemManager 'ncatbot/plugin/builtin/system_manager/main.py:70' ➜ 系统管理插件已关闭
+[2026-06-18 19:57:44.533] INFO     HandlerDispatcher 'ncatbot/core/registry/dispatcher.py:188' ➜ revoke_plugin(_system_manager): 移除 9 个 handler
+[2026-06-18 19:57:44.533] INFO     PluginLoader 'ncatbot/plugin/loader/core.py:232' ➜ 插件已卸载: _system_manager
+[2026-06-18 19:57:44.533] INFO     RBAC 'ncatbot/service/builtin/rbac/service.py:91' ➜ RBAC 服务已关闭
+[2026-06-18 19:57:44.534] INFO     TimeTaskService 'ncatbot/service/builtin/schedule/service.py:83' ➜ 定时任务服务已停止
+[2026-06-18 19:57:44.534] INFO     DispatchFilter 'ncatbot/service/builtin/dispatch_filter/service.py:63' ➜ 分发过滤服务已关闭
+[2026-06-18 19:57:44.534] INFO     BotClient 'ncatbot/app/client.py:290' ➜ 已关闭
