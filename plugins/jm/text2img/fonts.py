@@ -179,8 +179,18 @@ def _glob_system_fonts() -> list[str]:
     return candidates
 
 
-def _pick_first(paths: list[str], keywords: list[str]) -> Optional[str]:
-    """从路径列表里按关键词优先级挑一个。空列表返回 None。"""
+def _pick_first(paths: list[str], keywords: list[str], fallback_to_first: bool = False) -> Optional[str]:
+    """从路径列表里按关键词优先级挑一个。
+
+    Parameters
+    ----------
+    paths : 候选字体路径列表
+    keywords : 关键词优先级列表，按顺序匹配 basename（不区分大小写）
+    fallback_to_first : 如果没有任何关键词命中，是否退而求其次返回 paths[0]
+
+    没有关键词命中时，**默认返回 None** —— 这样上层 caller 才能正确走
+    链式 fallback（比如 cjk_jp 找不到带 JP 的，就退到 cjk 默认）。
+    """
     if not paths:
         return None
     seen: set[str] = set()
@@ -194,7 +204,7 @@ def _pick_first(paths: list[str], keywords: list[str]) -> Optional[str]:
         for p in unique:
             if kw_l in os.path.basename(p).lower():
                 return p
-    return unique[0]
+    return unique[0] if fallback_to_first else None
 
 
 def _classify(paths: list[str]) -> dict[str, list[str]]:
@@ -211,8 +221,8 @@ def _classify(paths: list[str]) -> dict[str, list[str]]:
         if "emoji" in name:
             classes["emoji"].append(p)
             continue
-        if any(kw in name for kw in ("cjk", "han", "pingfang", "yahei", "simsun",
-                                     "songti", "wenquanyi", "sourcehan", "notosanscjk")):
+        if any(kw in name for kw in ("cjk", "sourcehan", "pingfang", "yahei", "simsun",
+                                     "songti", "wenquanyi", "notosanscjk")):
             classes["cjk"].append(p)
             if any(kw in name for kw in ("sc", "cn", "chs")):
                 classes["cjk_sc"].append(p)
@@ -282,8 +292,11 @@ def detect_fontset() -> FontSet:
     classes["emoji"].extend(emoji_paths)
 
     # 4) 填充 FontSet
-    fs.cjk = _pick_first(classes["cjk"], ["NotoSansCJK-Regular", "NotoSansCJK",
-                                          "WenQuanYi", "SourceHan", "DroidSansFallback"])
+    fs.cjk = (
+        _pick_first(classes["cjk"], ["NotoSansCJK-Regular", "NotoSansCJK",
+                                     "WenQuanYi", "SourceHan", "DroidSansFallback"])
+        or _pick_first(classes["cjk"], [], fallback_to_first=True)  # 实在没有 → 取任意一个 cjk 类的
+    )
     fs.cjk_sc = (
         _pick_first(classes["cjk_sc"], ["SC", "CN", "NotoSansCJK", "SourceHanSansCN"])
         or _pick_first(classes["cjk"], ["SC", "CN"])
