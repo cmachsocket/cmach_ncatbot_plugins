@@ -83,12 +83,21 @@ class JmPlugin(NcatBotPlugin):
             await event.reply(text="ID must be an integer")
             return
         
-        result = await comic_download(id)
+        try:
+            async with asyncio.timeout(300):
+                result = await comic_download(id)
+        except asyncio.TimeoutError:
+            await event.reply(text="WARN : Download is lasting too long")
         if not result[0]:
             await event.reply(text=result[1])
             return
         _ , file = result[1].split("/")
-        await self.api.qq.send_group_file(event.group_id,result[1],name=file)
+        try:
+            await self.api.qq.send_group_file(event.group_id,result[1],name=file)
+        except asyncio.TimeoutError as e:
+            print("WARN : file send timeout.please check if the file has been sent successfully.")
+        except Exception as e:
+            await self.api.qq.send_group_plain_text(event.group_id,f"ncatbot send error")
     @registrar.on_group_command("/jmd",ignore_case=True)
     async def on_gourp_jm_detail(self,event:GroupMessageEvent) -> None :
         parts=event.message.text.split(" ")
@@ -100,12 +109,13 @@ class JmPlugin(NcatBotPlugin):
         except ValueError:
             await event.reply(text="ID must be an integer")
             return
-        result = await comic_detail(id)
+        try:
+            async with asyncio.timeout(300):
+                result = await comic_detail(id)
+        except asyncio.TimeoutError:
+            await event.reply(text="WARN : Get details is lasting too long")
         if not result[0]:
             await event.reply(text=result[1])
         else:
             await event.reply(text=result[1])
 
-
-if __name__ == "__main__":
-    asyncio.run(comic_detail(350234))
