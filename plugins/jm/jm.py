@@ -39,6 +39,8 @@ async def comic_download(id: int) -> tuple[bool, str]:
         return (False, (f"呜喵…下载失败了呢喵～"))
     except jmcomic.JmcomicException as e:
         return (False, (f"呜喵…JM 出错了喵～"))
+    except Exception as e:
+        return (False, (f"呜喵…奇怪的错误发生了喵～"))
     if os.path.exists(f"down/{id}.pdf"):
         return (True, f"down/{id}.pdf")
     else:
@@ -57,6 +59,8 @@ async def comic_detail(id: int) -> tuple[bool, str]:
             return (False, f"呜喵…请求都失败了喵～")
         except jmcomic.JmcomicException as e:
             return (False, f"呜喵…详情抓取出错了喵")
+        except Exception as e:
+            return (False, f"呜喵…奇怪的错误发生了喵～")
 
     def join_list(items):
         return "、".join(str(x) for x in items) if items else "无"
