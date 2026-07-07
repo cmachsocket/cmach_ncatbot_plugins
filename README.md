@@ -23,3 +23,5 @@ Feature:
 Feature:
 
 - 输入 `/wol` ，远程唤醒设备
+
+## 3. ClassHelper

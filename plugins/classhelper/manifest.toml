@@ -1,0 +1,9 @@
+name = "cmach.qzz.io.wol.plugin"
+version = "0.1.0"
+main = "classhelper.py"
+author = "cmach_socket"
+description = "help our class to inform our students."
+entry_class = "HelperPlugin"
+pip_dependencies = []
+
+[dependencies]
