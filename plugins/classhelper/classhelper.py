@@ -120,8 +120,7 @@ class HelperPlugin(NcatBotPlugin):
     description = "班级小助手：function calling 决策 forward/reminder/nothing"
 
     def _init_(self) -> None:
-        self.timer_messages: List[Tuple[datetime.datetime, str]] = []
-        self.processed_ids: set = set()
+        pass
 
     async def on_load(self) -> None:
         self.logger.info(f"{self.name} 已加载")
@@ -130,6 +129,9 @@ class HelperPlugin(NcatBotPlugin):
         self.logger.info(f"{self.name} 已卸载")
 
     # ---------- 群消息入口 ----------
+
+    async def timer_task(self,content : str) -> None:
+        await self.api.qq.send_group_text(TARGET_GROUP_ID,content)
 
     @registrar.on_group_message()
     @group_filter_hook(group_from=SOURCE_GROUP_ID)
@@ -183,7 +185,7 @@ class HelperPlugin(NcatBotPlugin):
             if name == "need_forward_message":
                 # 直接转发原消息（保留图片/表情/at）
                 try:
-                    await self.api.qq.forward_group_single_msg(
+                    await self.api.qq.messaging.forward_group_single_msg(
                         group_id=TARGET_GROUP_ID,
                         message_id=event.message_id,
                     )
@@ -208,8 +210,7 @@ class HelperPlugin(NcatBotPlugin):
                     if t <= datetime.datetime.now():
                         self.logger.warning(f"忽略过期提醒：{t}")
                         continue
-                    self.timer_messages.append((t, content))
-                    self._save_state()
+                    self.add_scheduled_task(timer_task, ,conditions=[])
                     self.logger.info(f"已添加提醒：{t:%Y-%m-%d %H:%M} - {content}")
                 except Exception:
                     self.logger.exception("添加提醒失败")
