@@ -19,14 +19,6 @@ from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.core.registry.hook import Hook, HookAction, HookContext, HookStage
 from ncatbot.types import MessageArray, PlainText
 
-
-# ============== 配置 ==============
-SOURCE_GROUP_ID = 1019963716       # 监听源群
-TARGET_GROUP_ID = 1042964394       # 转发目标群
-MANAGER_USER_ID = 3077906125       # 异常上报
-AI_MODEL = "MiniMax-M3"
-
-
 # ============== System Prompt（所有规则集中在这）==============
 SYSTEM_PROMPT = """你是班级小助手，负责审核源群消息。
 
@@ -81,31 +73,6 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
 
 
 
-# ============== 群过滤 hook ==============
-
-def group_filter_hook(group_from: int) -> Hook:
-    return GroupFilterHook(group_from=group_from)
-
-
-class GroupFilterHook(Hook):
-    stage = HookStage.BEFORE_CALL
-    priority = 50
-
-    def __init__(self, group_from: int):
-        self.group_from = group_from
-
-    async def execute(self, ctx: HookContext) -> HookAction:
-        gid = getattr(ctx.event.data, "group_id", None)
-        if gid is None:
-            return HookAction.SKIP
-        try:
-            gid_int = int(gid)
-        except (TypeError, ValueError):
-            return HookAction.SKIP
-        if gid_int == self.group_from:
-            return HookAction.CONTINUE
-        return HookAction.SKIP
-
 
 # ============== Plugin ==============
 
@@ -117,16 +84,15 @@ class HelperPlugin(NcatBotPlugin):
     description = "班级小助手：function calling 决策 forward/reminder/nothing"
 
     async def on_load(self) -> None:
-        global SOURCE_GROUP_ID, TARGET_GROUP_ID, MANAGER_USER_ID, AI_MODEL
         self.init_defaults({"SOURCE_GROUP_ID": 1019963716,
                             "TARGET_GROUP_ID": 1042964394,
                             "MANAGER_USER_ID": 3077906125,
                             "AI_MODEL": "MiniMax-M3"
                            })
-        SOURCE_GROUP_ID = self.get_config("SOURCE_GROUP_ID")
-        TARGET_GROUP_ID = self.get_config("TARGET_GROUP_ID")
-        MANAGER_USER_ID = self.get_config("MANAGER_USER_ID")
-        AI_MODEL = self.get_config("AI_MODEL")
+        self.SOURCE_GROUP_ID = self.get_config("SOURCE_GROUP_ID")
+        self.TARGET_GROUP_ID = self.get_config("TARGET_GROUP_ID")
+        self.MANAGER_USER_ID = self.get_config("MANAGER_USER_ID")
+        self.AI_MODEL = self.get_config("AI_MODEL")
         self.logger.info(f"{self.name} 已加载")
 
     async def on_close(self) -> None:
@@ -138,7 +104,7 @@ class HelperPlugin(NcatBotPlugin):
         """异常时给管理员发私聊；自身失败静默吞掉。"""
         try:
             await self.api.qq.post_private_msg(
-                user_id=MANAGER_USER_ID,
+                user_id=self.MANAGER_USER_ID,
                 text=text,
             )
         except Exception:
@@ -148,14 +114,14 @@ class HelperPlugin(NcatBotPlugin):
   
 
     @registrar.on_group_message()
-    @group_filter_hook(group_from=SOURCE_GROUP_ID)
     async def on_group_message(self, event: GroupMessageEvent) -> None:
 
-        # 纯图片 / 表情 / CQ 码等无纯文本的消息，LLM 无可决策依据，跳过
-        text = event.raw_message
-        if not text:
+        if event.group_id != self.SOURCE_GROUP_ID: # registrar : what a piece of shit
             return
-
+        # 纯图片 / 表情 / CQ 码等无纯文本的消息，LLM 无可决策依据，跳过
+        if not event.message.filter_text() or not event.message.filter_image():
+            self.logger.info(f"忽略无文本/图片消息：{event.message}")
+            return
         # SYSTEM_PROMPT 作为 PlainText 段塞到 event.message 前面
         # chat() 内部会把所有 PlainText 拼成一个 text content
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -170,7 +136,7 @@ class HelperPlugin(NcatBotPlugin):
                 combined_message,
                 tools=TOOLS_SCHEMA,    # **kwargs → litellm
                 tool_choice="auto",
-                model=AI_MODEL,
+                model=self.AI_MODEL,
             )
         except Exception:
             self.logger.exception("LLM 调用失败")
@@ -185,14 +151,14 @@ class HelperPlugin(NcatBotPlugin):
         async def do_forward() -> None:
             try:
                 await self.api.qq.messaging.forward_group_single_msg(
-                    group_id=TARGET_GROUP_ID,
+                    group_id=self.TARGET_GROUP_ID,
                     message_id=event.message_id,
                 )
                 self.logger.info(f"已转发 message_id={event.message_id}")
             except Exception as e:
                 self.logger.exception("转发失败")
                 await self._notify_manager(
-                    f"转发失败：{e!r}\n原消息：{text[:200]}"
+                    f"转发失败：{e!r}\n原消息：{event.raw_message[:200]}"
                 )
 
         async def do_add_timer(args: Dict[str, Any]) -> None:
@@ -218,7 +184,7 @@ class HelperPlugin(NcatBotPlugin):
             # 注册定时任务（用 event.message_id 保证名字唯一）
             async def timer_callback():
                 try:
-                    await self.api.qq.send_group_text(TARGET_GROUP_ID, content)
+                    await self.api.qq.send_group_text(self.TARGET_GROUP_ID, content)
                 except Exception:
                     self.logger.exception("定时消息发送失败")
 
