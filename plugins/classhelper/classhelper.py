@@ -23,7 +23,7 @@ from ncatbot.types import MessageArray, PlainText
 SOURCE_GROUP_ID = 1019963716       # 监听源群
 TARGET_GROUP_ID = 1042964394       # 转发目标群
 MANAGER_USER_ID = 3077906125       # 异常上报
-AI_MODEL = "MiniMax-M2.7"
+AI_MODEL = "MiniMax-M3"
 PROCESSED_CACHE_MAX = 2000
 
 
@@ -33,7 +33,7 @@ SYSTEM_PROMPT = """你是班级小助手，负责审核源群消息。
 收到用户消息后，判断需要做什么，调用合适的 tool：
 - need_forward_message：消息对班级同学有用（通知/活动/重要信息）
 - add_timer_message：消息提到未来某个时间要做某事
-- do_nothing：闲聊/无关/两者都不需要
+- do_nothing：闲聊/无关/广告/两者都不需要
 
 可以一次调用多个 tool。提醒时间必须晚于当前时间至少 1 分钟。
 
@@ -81,14 +81,6 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
 ]
 
 
-# ============== 工具函数 ==============
-
-def _extract_text(msg_array) -> str:
-    """从 event.message (MessageArray) 提取纯文本"""
-    return "".join(
-        seg.text for seg in msg_array if hasattr(seg, "text")
-    ).strip()
-
 
 # ============== 群过滤 hook ==============
 
@@ -129,25 +121,14 @@ class HelperPlugin(NcatBotPlugin):
         self.logger.info(f"{self.name} 已卸载")
 
     # ---------- 群消息入口 ----------
-
-    async def timer_task(self,content : str) -> None:
-        await self.api.qq.send_group_text(TARGET_GROUP_ID,content)
+  
 
     @registrar.on_group_message()
     @group_filter_hook(group_from=SOURCE_GROUP_ID)
     async def on_group_message(self, event: GroupMessageEvent) -> None:
-        # 去重
-        if event.message_id in self.processed_ids:
-            return
-        self.processed_ids.add(event.message_id)
-        if len(self.processed_ids) > PROCESSED_CACHE_MAX:
-            self.processed_ids = set(
-                list(self.processed_ids)[-PROCESSED_CACHE_MAX // 2 :]
-            )
 
         # 从 event.message 提取纯文本（用于跳过空消息 + 异常上报）
-        text = _extract_text(event.message)
-        if not text:
+        if not event.raw_message:
             return
 
         # SYSTEM_PROMPT 作为 PlainText 段塞到 event.message 前面
@@ -195,7 +176,7 @@ class HelperPlugin(NcatBotPlugin):
                     try:
                         await self.api.qq.post_private_msg(
                             user_id=MANAGER_USER_ID,
-                            text=f"转发失败\n原消息：{text[:200]}",
+                            text=f"转发失败\n原消息：{event.raw_message[:200]}",
                         )
                     except Exception:
                         pass
@@ -210,7 +191,9 @@ class HelperPlugin(NcatBotPlugin):
                     if t <= datetime.datetime.now():
                         self.logger.warning(f"忽略过期提醒：{t}")
                         continue
-                    self.add_scheduled_task(timer_task, ,conditions=[])
+                    async def timer_callback():
+                        await self.api.qq.send_group_text(TARGET_GROUP_ID,content)
+                    self.add_scheduled_task("timer_task", t.strftime("%Y-%m-%d %H:%M:%S"),callback=timer_callback)
                     self.logger.info(f"已添加提醒：{t:%Y-%m-%d %H:%M} - {content}")
                 except Exception:
                     self.logger.exception("添加提醒失败")
