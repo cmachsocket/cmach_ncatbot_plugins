@@ -16,7 +16,6 @@ from typing import Any, Dict, List
 from ncatbot.plugin import NcatBotPlugin
 from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
-from ncatbot.core.registry.hook import Hook, HookAction, HookContext, HookStage
 from ncatbot.types import MessageArray, PlainText
 
 # ============== System Prompt（所有规则集中在这）==============
@@ -116,10 +115,10 @@ class HelperPlugin(NcatBotPlugin):
     @registrar.on_group_message()
     async def on_group_message(self, event: GroupMessageEvent) -> None:
 
-        if event.group_id != self.SOURCE_GROUP_ID: # registrar : what a piece of shit
+        if str(event.group_id) != str(self.SOURCE_GROUP_ID): # registrar : what a piece of shit
             return
         # 纯图片 / 表情 / CQ 码等无纯文本的消息，LLM 无可决策依据，跳过
-        if not event.message.filter_text() or not event.message.filter_image():
+        if not event.message.filter_text() and not event.message.filter_image():
             self.logger.info(f"忽略无文本/图片消息：{event.message}")
             return
         # SYSTEM_PROMPT 作为 PlainText 段塞到 event.message 前面
@@ -158,7 +157,7 @@ class HelperPlugin(NcatBotPlugin):
             except Exception as e:
                 self.logger.exception("转发失败")
                 await self._notify_manager(
-                    f"转发失败：{e!r}\n原消息：{event.raw_message[:200]}"
+                    f"转发失败：{e!r}\n原消息：{event.raw_message[:50]}"
                 )
 
         async def do_add_timer(args: Dict[str, Any]) -> None:
