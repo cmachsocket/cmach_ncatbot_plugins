@@ -117,6 +117,16 @@ class HelperPlugin(NcatBotPlugin):
     description = "班级小助手：function calling 决策 forward/reminder/nothing"
 
     async def on_load(self) -> None:
+        global SOURCE_GROUP_ID, TARGET_GROUP_ID, MANAGER_USER_ID, AI_MODEL
+        self.init_defaults({"SOURCE_GROUP_ID": 1019963716,
+                            "TARGET_GROUP_ID": 1042964394,
+                            "MANAGER_USER_ID": 3077906125,
+                            "AI_MODEL": "MiniMax-M3"
+                           })
+        SOURCE_GROUP_ID = self.get_config("SOURCE_GROUP_ID")
+        TARGET_GROUP_ID = self.get_config("TARGET_GROUP_ID")
+        MANAGER_USER_ID = self.get_config("MANAGER_USER_ID")
+        AI_MODEL = self.get_config("AI_MODEL")
         self.logger.info(f"{self.name} 已加载")
 
     async def on_close(self) -> None:
