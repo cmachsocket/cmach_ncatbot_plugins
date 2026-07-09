@@ -134,15 +134,6 @@ class HelperPlugin(NcatBotPlugin):
         except Exception:
             self.logger.exception("上报 manager 失败")
 
-    @staticmethod
-    def _extract_text(message: MessageArray) -> str:
-        """提取 MessageArray 里所有 PlainText 段拼起来的纯文本。"""
-        parts = []
-        for seg in message:
-            if isinstance(seg, PlainText):
-                parts.append(seg.text)
-        return "".join(parts).strip()
-
     # ---------- 群消息入口 ----------
   
 
@@ -151,7 +142,7 @@ class HelperPlugin(NcatBotPlugin):
     async def on_group_message(self, event: GroupMessageEvent) -> None:
 
         # 纯图片 / 表情 / CQ 码等无纯文本的消息，LLM 无可决策依据，跳过
-        text = self._extract_text(event.message)
+        text = event.raw_message
         if not text:
             return
 
