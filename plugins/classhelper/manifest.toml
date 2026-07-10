@@ -1,4 +1,4 @@
-name = "cmach.qzz.io.wol.plugin"
+name = "cmach.classhelper.plugin"
 version = "0.1.0"
 main = "classhelper.py"
 author = "cmach_socket"
