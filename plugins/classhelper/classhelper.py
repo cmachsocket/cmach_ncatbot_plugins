@@ -86,7 +86,7 @@ class HelperPlugin(NcatBotPlugin):
         self.init_defaults({"SOURCE_GROUP_ID": 1019963716,
                             "TARGET_GROUP_ID": 1042964394,
                             "MANAGER_USER_ID": 3077906125,
-                            "AI_MODEL": "MiniMax-M3"
+                            "AI_MODEL": "minimax/minimax-m3"
                            })
         self.SOURCE_GROUP_ID = self.get_config("SOURCE_GROUP_ID")
         self.TARGET_GROUP_ID = self.get_config("TARGET_GROUP_ID")
