@@ -135,7 +135,6 @@ class HelperPlugin(NcatBotPlugin):
                 combined_message,
                 tools=TOOLS_SCHEMA,    # **kwargs → litellm
                 tool_choice="auto",
-                model=self.AI_MODEL,
             )
         except Exception:
             self.logger.exception("LLM 调用失败")
