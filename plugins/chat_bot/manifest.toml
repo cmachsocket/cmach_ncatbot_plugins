@@ -1,0 +1,6 @@
+name = "chat_bot"
+version = "1.0.0"
+main = "chat_bot.py"
+entry_class = "AIHelloWorldPlugin"
+author = "cmach_socket"
+description = "AI 适配器基础用法 — Chat / Embeddings / ImageGen"
