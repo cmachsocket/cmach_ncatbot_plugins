@@ -37,7 +37,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                     },
                     "reply": {
                         "type": "boolean",
-                        "description": "是否回复当前用户的消息；true 为回复，false 为直接发送到群聊",
+                        "description": "是否回复当前用户的消息；true 为回复，false 为不回复",
                     },
                 },
                 "required": ["content", "reply"],
@@ -131,8 +131,6 @@ class AIHelloWorldPlugin(NcatBotPlugin):
     ) -> None:
         """向当前群聊发送消息，可选择是否回复当前消息。"""
         if reply:
-            await event.reply(content)
-        else:
             await self.api.qq.send_group_text(event.group_id, content)
     def is_target_group(self, group_id) -> bool:
         """检查消息是否来自目标群聊。"""
