@@ -59,7 +59,7 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
         self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}") 
         hindsight_litellm.configure(hindsight_api_url=f"http://localhost:{self.hindsight_port}")
-        #hindsight_litellm.set_defaults(bank_id="default-bank")  # 设置一个默认值
+        hindsight_litellm.set_defaults(bank_id="default-bank")  # 设置一个默认值
         hindsight_litellm.enable()
         info = await self.api.qq.query.get_login_info()
         self.bot_id = info.user_id
