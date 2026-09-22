@@ -88,7 +88,9 @@ class AIHelloWorldPlugin(NcatBotPlugin):
     hindsight_port = 7071
     target_group_id = 1093424135
     bot_id = None
+    assistent_messages: List[Dict[str, str]]  # 用于存储上下文
     async def on_load(self) -> None:
+        self.assistent_messages = []
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
         #self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}") 
@@ -98,31 +100,6 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         hindsight_litellm.enable()
         info = await self.api.qq.query.get_login_info()
         self.bot_id = info.user_id
-    @registrar.qq.on_group_message()
-    async def ai_memory(self, event: GroupMessageEvent) -> None:
-        # stub first
-        return
-        if not self.is_target_group(event.group_id):
-            return
-        if self.bot_id == event.user_id:
-            self.logger.info("忽略自己发送的消息")
-            return
-        text = event.message.text
-        id = event.user_id
-        timestamp = datetime.fromtimestamp(event.time)
-        #拼接所有at
-        ats = ""
-        for at in event.message.filter_at():
-            ats += f" @ {at.user_id} , "
-        if(self.hindsight == None):
-            self.logger.error("Hindsight 未初始化")
-            return
-        await self.hindsight.aretain(
-            bank_id = id,
-            content = text,
-            timestamp = timestamp,
-            metadata = {"at" : ats}
-        )
 
     @registrar.qq.on_group_message()
     async def ai_chat(self, event: GroupMessageEvent) -> None:
@@ -133,10 +110,12 @@ class AIHelloWorldPlugin(NcatBotPlugin):
             return
         at_list = event.message.filter_at()
         is_at_me = any(str(at.user_id) == self.bot_id for at in at_list)
+        user_name = await self.get_user_name(event.user_id)
+        user_message = f"{user_name}: {event.message.text}"
         IS_AT_SYSTEM_PROMPT = ("(你被 @ 了，此条必须回复)" if is_at_me else "\n\n(你没有被 @，可以选择不回复)")
         resp = await self.api.ai.chat([
               {"role": "system", "content": SYSTEM_PROMPT + IS_AT_SYSTEM_PROMPT},
-              {"role": "user", "content": event.message.text},
+              {"role": "user", "content":user_message},
               ],
         tools=TOOLS_SCHEMA,
         tool_choice={
@@ -148,6 +127,7 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         if not message.tool_calls:
             return
 
+        content = "" # 作用域
         for tool_call in message.tool_calls:
             if tool_call.function.name != "send_message":
                 continue
@@ -160,6 +140,11 @@ class AIHelloWorldPlugin(NcatBotPlugin):
             reply = arguments.get("reply")
             if isinstance(content, str) and content.strip() and isinstance(reply, bool):
                 await self.send_message(event, content, reply)
+        self.add_assistent_message(
+            bot_content= content if isinstance(content,str) else "",
+            user_id=event.user_id,
+            message=user_message,
+        )
 
     async def send_message(
         self, event: GroupMessageEvent, content: str, reply: bool
@@ -170,3 +155,34 @@ class AIHelloWorldPlugin(NcatBotPlugin):
     def is_target_group(self, group_id) -> bool:
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
+    def add_assistent_message(self, bot_content: str, user_id: str, message: str):
+        """添加助手消息到历史记录中。"""
+        return
+        # stub中，需要处理过期问题   
+        self.assistent_messages.append({
+            "role": "assistant",
+            "content": message,
+        })
+        if bot_content == "":
+            return
+        self.assistent_messages.append({
+            "role": "assistant",
+            "content": bot_content,
+        })
+    async def get_user_name(self, user_id: int | str) -> str:
+        """查询用户在该群的显示名，优先群昵称，回退到 QQ 昵称"""
+        try:
+            member_info = await self.api.qq.query.get_group_member_info(
+                self.target_group_id, user_id
+            )
+        except Exception as e:
+            self.logger.warning("获取群成员信息失败 user_id=%s: %s", user_id, e)
+            return "未知用户"
+
+        if not member_info:
+            return "未知用户"
+
+        # card 可能为 "" 或 None，nickname 通常是 QQ 昵称
+        card = getattr(member_info, "card", None)
+        nickname = getattr(member_info, "nickname", None)
+        return card or nickname or "未知用户"
