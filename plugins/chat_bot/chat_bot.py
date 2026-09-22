@@ -45,9 +45,11 @@ class AIHelloWorldPlugin(NcatBotPlugin):
     name = "hello_world_ai"
     hindsight = None
     hindsight_port = 7071
+    target_group_id = 1093424135
     bot_id = None
     async def on_load(self) -> None:
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
+        self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
         self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}") 
         hindsight_litellm.configure(hindsight_api_url=f"http://localhost:{self.hindsight_port}")
         hindsight_litellm.set_defaults(bank_id="default-bank")  # 设置一个默认值
@@ -58,6 +60,8 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         self.bot_id = info.user_id
     @registrar.qq.on_group_message()
     async def ai_memory(self, event: GroupMessageEvent) -> None:
+        if not self.is_target_group(event.group_id):
+            return
         if self.bot_id == event.user_id:
             self.logger.info("忽略自己发送的消息")
             return
@@ -83,12 +87,14 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         """简单 AI 对话：ai 你好
         prompt 由自动参数绑定提取，缺失时框架自动回复用法。
         """
+        if not self.is_target_group(event.group_id):
+            return
         at_list = event.message.filter_at()
         is_at_me = any(str(at.user_id) == self.bot_id for at in at_list)
         IS_AT_SYSTEM_PROMPT = ("(你被 @ 了，此条必须回复)" if is_at_me else "\n\n(你没有被 @，可以选择不回复)")
         resp = await self.api.ai.chat([
               {"role": "system", "content": SYSTEM_PROMPT + IS_AT_SYSTEM_PROMPT},
-              {"role": f"user-{event.user_id}", "content": event.message.text},
+              {"role": "user", "content": event.message.text},
               ],
         tools=TOOLS_SCHEMA,
         tool_choice={
@@ -121,3 +127,6 @@ class AIHelloWorldPlugin(NcatBotPlugin):
             await event.reply(content)
         else:
             await self.api.qq.send_group_text(event.group_id, content)
+    def is_target_group(self, group_id) -> bool:
+        """检查消息是否来自目标群聊。"""
+        return str(group_id) == str(self.target_group_id)
