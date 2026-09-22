@@ -60,6 +60,8 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         self.bot_id = info.user_id
     @registrar.qq.on_group_message()
     async def ai_memory(self, event: GroupMessageEvent) -> None:
+        # stub first
+        return
         if not self.is_target_group(event.group_id):
             return
         if self.bot_id == event.user_id:
@@ -75,7 +77,7 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         if(self.hindsight == None):
             self.logger.error("Hindsight 未初始化")
             return
-        self.hindsight.retain(
+        await self.hindsight.aretain(
             bank_id = id,
             content = text,
             timestamp = timestamp,
