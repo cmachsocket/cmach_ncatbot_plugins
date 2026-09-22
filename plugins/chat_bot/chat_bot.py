@@ -5,7 +5,41 @@ import hindsight_litellm
 from hindsight_client import Hindsight
 from datetime import datetime
 import json
+import asyncio
+import concurrent.futures
 from typing import Any, Dict, List
+
+
+def _patch_hindsight_run_async() -> None:
+    """Monkey patch hindsight_client._run_async to be safe inside a running event loop.
+
+    hindsight_client.Hindsight.recall/reflect 是同步包装，它们内部调用 _run_async(coro)
+    在已运行的 event loop 里再 run_until_complete 会抛 RuntimeError，协程泄漏并触发
+    RuntimeWarning。本函数在 on_load 时替换 _run_async：当前 loop 未运行则维持原行为，
+    已在运行则把协程丢到独立线程的新 loop 里跑。
+    """
+    import hindsight_client.hindsight_client as _hc
+
+    def _safe_run_async(coro):
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            def _runner():
+                new_loop = asyncio.new_event_loop()
+                try:
+                    return new_loop.run_until_complete(coro)
+                finally:
+                    new_loop.close()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(_runner).result()
+        return loop.run_until_complete(coro)
+
+    _hc._run_async = _safe_run_async
 
 SYSTEM_PROMPT = \
 """
@@ -57,7 +91,8 @@ class AIHelloWorldPlugin(NcatBotPlugin):
     async def on_load(self) -> None:
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
-        self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}") 
+        #self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}") 
+        _patch_hindsight_run_async()
         hindsight_litellm.configure(hindsight_api_url=f"http://localhost:{self.hindsight_port}")
         hindsight_litellm.set_defaults(bank_id="default-bank")  # 设置一个默认值
         hindsight_litellm.enable()
