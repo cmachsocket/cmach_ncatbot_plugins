@@ -10,4 +10,6 @@ dependencies = [
     "litellm",
     "ncatbot5",
     "wakeonlan",
+    "hindsight_litellm",
+    "hindsight_client",
 ]
