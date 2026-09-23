@@ -2,17 +2,14 @@ from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 import hindsight_litellm
-from hindsight_client import Hindsight
-from datetime import datetime
-import math
+from time_controller import TemperatureController
 import json
 import asyncio
 import concurrent.futures
-import os
-import pickle
 import time
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from ncatbot.types import MessageArray,Reply,PlainText,At
 
 
 def _patch_hindsight_run_async() -> None:
@@ -86,136 +83,19 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
 ]
 
 
-class TemperatureController:
-    """按真实时间控制温度、上下文窗口和重加热。"""
-
-    def __init__(
-        self,
-        window_max: int = 40,
-        window_min: int = 4,
-        temperature_initial: float = 1.0,
-        temperature_max: float = 1.5,
-        temperature_min: float = 0.05,
-        temperature_tau: float = 1800.0,
-        reheat_multiplier: float = 4.0,
-        reheat_cooldown: float = 60.0,
-        state_path: str | Path = "data/chat_bot_temperature.pkl",
-    ) -> None:
-        self.window_max = window_max
-        self.window_min = window_min
-        self.temperature_initial = temperature_initial
-        self.temperature_max = temperature_max
-        self.temperature_min = temperature_min
-        self.temperature_tau = temperature_tau
-        self.reheat_multiplier = reheat_multiplier
-        self.reheat_cooldown = reheat_cooldown
-        self.state_path = Path(state_path)
-        self.temperature_base = temperature_initial
-        self.temperature_base_time = time.monotonic()
-        self.last_reheat_time = 0.0
-        self._load_state()
-
-    def _load_state(self) -> None:
-        try:
-            with self.state_path.open("rb") as state_file:
-                state = pickle.load(state_file)
-            saved_at = float(state["saved_at"])
-            elapsed = max(0.0, time.time() - saved_at)
-            self.temperature_base = max(
-                self.temperature_min,
-                min(self.temperature_max, float(state["temperature_base"])),
-            )
-            self.temperature_base_time = time.monotonic() - elapsed
-            last_reheat_at = state.get("last_reheat_at")
-            if last_reheat_at is not None:
-                self.last_reheat_time = time.monotonic() - max(
-                    0.0, time.time() - float(last_reheat_at)
-                )
-        except (
-            FileNotFoundError,
-            EOFError,
-            KeyError,
-            TypeError,
-            ValueError,
-            OSError,
-            pickle.PickleError,
-        ):
-            self._save_state()
-
-    def _save_state(self) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = self.state_path.with_suffix(
-            self.state_path.suffix + ".tmp"
-        )
-        state = {
-            "saved_at": time.time(),
-            "temperature_base": self.temperature_base,
-            "last_reheat_at": (
-                time.time() - (time.monotonic() - self.last_reheat_time)
-                if self.last_reheat_time
-                else None
-            ),
-        }
-        with temporary_path.open("wb") as state_file:
-            pickle.dump(state, state_file, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(temporary_path, self.state_path)
-
-    def current_temperature(self, now: float | None = None) -> float:
-        if now is None:
-            now = time.monotonic()
-        elapsed = max(0.0, now - self.temperature_base_time)
-        return self.temperature_min + (
-            self.temperature_base - self.temperature_min
-        ) * math.exp(-elapsed / self.temperature_tau)
-
-    def temperature_to_window(self, temperature: float) -> int:
-        temperature = max(self.temperature_min, min(self.temperature_max, temperature))
-        position = (
-            math.log(temperature) - math.log(self.temperature_min)
-        ) / (
-            math.log(self.temperature_initial) - math.log(self.temperature_min)
-        )
-        position = max(0.0, min(1.0, position))
-        window = self.window_min + position * (self.window_max - self.window_min)
-        return min(self.window_max, max(self.window_min, int(window)))
-
-    def reheat(self, now: float | None = None) -> float:
-        if now is None:
-            now = time.monotonic()
-        temperature = self.current_temperature(now)
-        self.temperature_base = min(
-            self.temperature_max, self.reheat_multiplier * temperature
-        )
-        self.temperature_base_time = now
-        self.last_reheat_time = now
-        self._save_state()
-        return self.temperature_base
-
-    def should_reheat(
-        self, message: str, temperature: float, now: float | None = None
-    ) -> bool:
-        if now is None:
-            now = time.monotonic()
-        if now - self.last_reheat_time < self.reheat_cooldown:
-            return False
-        old_memory_markers = ("之前", "刚才", "上次", "记得", "忘了", "忘记")
-        complex_query = len(message) >= 80 or any(
-            marker in message for marker in old_memory_markers
-        )
-        return complex_query and temperature <= self.temperature_max * 0.65
 
 
-class AIHelloWorldPlugin(NcatBotPlugin):
+class AIPlugin(NcatBotPlugin):
     """AI 适配器基础用法示例"""
 
     name = "hello_world_ai"
-    hindsight = None
-    hindsight_port = 7071
-    target_group_id = 1093424135
-    bot_id = None
-    assistent_messages: List[Dict[str, str]]  # 用于存储上下文
-    max_k = 60  # 历史消息缓存上限
-    dynamic_k = 40  # 温度动态调节的基准上下文窗口
+    hindsight: Any = None
+    hindsight_port: int = 7071
+    target_group_id: int = 1093424135
+    bot_id: Optional[str] = None
+    assistent_messages: List[Dict[str, str]] = []  # 用于存储上下文
+    max_k: int = 60  # 历史消息缓存上限
+    dynamic_k: int = 40  # 温度动态调节的基准上下文窗口
 
     async def on_load(self) -> None:
         self.assistent_messages = []
@@ -289,10 +169,10 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         """向当前群聊发送消息，可选择是否回复当前消息。"""
         if reply:
             await self.api.qq.send_group_text(event.group_id, content)
-    def is_target_group(self, group_id) -> bool:
+    def is_target_group(self, group_id: int | str) -> bool:
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
-    def add_assistent_message(self, bot_content: str, user_id: str, message: str):
+    def add_assistent_message(self, bot_content: str, user_id: str, message: str) -> None:
         """添加助手消息到历史记录中。"""
         self.assistent_messages.append({
             "role": "assistant",
@@ -320,6 +200,26 @@ class AIHelloWorldPlugin(NcatBotPlugin):
             return "未知用户"
 
         # card 可能为 "" 或 None，nickname 通常是 QQ 昵称
-        card = getattr(member_info, "card", None)
-        nickname = getattr(member_info, "nickname", None)
+        card: str = getattr(member_info, "card", "") or ""
+        nickname: str = getattr(member_info, "nickname", "") or ""
         return card or nickname or "未知用户"
+    async def resolve_message(self, messages: MessageArray) -> str:
+        """解析消息内容"""
+        message = ""
+        reply_msg = "<quote>"
+        reply_ids = messages.filter(Reply)
+        for reply in reply_ids:
+            name = await self.get_user_name(reply.id)
+            message_data=await self.api.qq.query.get_msg(reply.id)
+            # get_msg 返回 MessageData，消息段列表位于其 message 属性中。
+            reply_msg += f"{name}：{MessageArray.from_list(message_data.message or []).text}\n"
+        reply_msg += "</quote>\n"
+        if(len(reply_ids) > 0):
+            message += reply_msg
+        for msg in messages:
+            if isinstance(msg, PlainText):
+                message += msg.text
+            elif isinstance(msg, At):
+                name = await self.get_user_name(msg.user_id)
+                message += f"@{name} "
+        return message

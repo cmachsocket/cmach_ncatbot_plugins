@@ -11,3 +11,4 @@ wheels/
 logs/
 down/
 config.yaml
+.vscode/
