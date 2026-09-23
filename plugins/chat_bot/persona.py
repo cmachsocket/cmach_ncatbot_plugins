@@ -278,7 +278,19 @@ class SocialDynamics:
         g = self.groups[group_id]
 
         if is_at_me and self.DECIDE_FORCED_AT_ME:
-            return True, {"forced": "at_me", "z": float("inf"), "p": 1.0}
+            return True, {
+                "forced": "at_me",
+                "z": float("inf"),
+                "p": 1.0,
+                "attention": g.attention,
+                "energy": g.energy,
+                "mood": g.mood,
+                "arousal": g.arousal,
+                "affection": g.affection.get(user_id, 0.4),
+                "trust": g.trust.get(user_id, 0.5),
+                "fatigue": g.fatigue.get(user_id, 0.0),
+                "trigger": 0.0,
+            }
 
         affection = g.affection.get(user_id, 0.4)
         fatigue_v = g.fatigue.get(user_id, 0.0)

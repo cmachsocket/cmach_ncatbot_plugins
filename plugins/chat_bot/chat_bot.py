@@ -192,14 +192,15 @@ class AIPlugin(NcatBotPlugin):
 
         decision_ctx = (
             f"\n[动力学状态] "
-            f"决定概率 p={decision_info.get('p', 0):.2f} z={decision_info.get('z', 0):.1f}\n"
-            f"attention={decision_info['attention']:.2f} "
-            f"energy={decision_info['energy']:.2f} "
-            f"mood={decision_info['mood']:+.2f} "
-            f"arousal={decision_info['arousal']:.2f}\n"
-            f"对 {user_name}：affection={decision_info['affection']:.2f} "
-            f"trust={decision_info['trust']:.2f} "
-            f"fatigue={decision_info['fatigue']:.2f}\n"
+            f"决定概率 p={decision_info.get('p', 0):.2f} "
+            f"z={decision_info.get('z', 0):.1f}\n"
+            f"attention={decision_info.get('attention', 0):.2f} "
+            f"energy={decision_info.get('energy', 0):.2f} "
+            f"mood={decision_info.get('mood', 0):+.2f} "
+            f"arousal={decision_info.get('arousal', 0):.2f}\n"
+            f"对 {user_name}：affection={decision_info.get('affection', 0):.2f} "
+            f"trust={decision_info.get('trust', 0):.2f} "
+            f"fatigue={decision_info.get('fatigue', 0):.2f}\n"
             f"目标回复长度 ≤ {target_len} 字\n"
             + ("(你被 @ 了，此条必须回复)\n" if is_at_me
                else "(按动力学结果：可能回也可能不回)\n")
