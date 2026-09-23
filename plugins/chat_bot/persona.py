@@ -75,6 +75,11 @@ class GroupDynamics:
     last_spoke_to: dict[str, float] = field(default_factory=dict)
     last_tick: float = field(default_factory=time.monotonic)
 
+    # ---- 对某 user 的近期消息时间（用于疲劳判断）----
+    recency_to_user: defaultdict[str, deque[float]] = field(
+        default_factory=lambda: defaultdict(lambda: deque(maxlen=20))
+    )
+
     # ---- 短期记忆 ----
     said_recently: deque[int] = field(default_factory=lambda: deque(maxlen=20))
 
@@ -208,10 +213,13 @@ class SocialDynamics:
         else:
             g.affection[user_id] = min(1.0, g.affection[user_id] + 0.003)
 
-        # 疲劳：连续互动
-        last_with = g.last_spoke_to.get(user_id, 0)
-        if now - last_with < 30:
-            g.fatigue[user_id] = min(1.0, g.fatigue.get(user_id, 0.0) + 0.15)
+        # 疲劳：连续互动（看 recency 队列而不是 last_spoke_to，
+        #     避免『首次互动也算疲劳』的 bug）
+        g.recency_to_user[user_id].append(now)
+        recent_60s = sum(1 for t in g.recency_to_user[user_id] if now - t <= 60)
+        # 60s 内累计 4 条以上 → 疲劳上升
+        if recent_60s >= 4:
+            g.fatigue[user_id] = min(1.0, g.fatigue.get(user_id, 0.0) + 0.10 * recent_60s)
         else:
             g.fatigue[user_id] = g.fatigue.get(user_id, 0.0) * 0.9
 

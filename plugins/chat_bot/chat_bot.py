@@ -3,13 +3,15 @@ from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 import hindsight_litellm
 from time_controller import TemperatureController
+from persona import SocialDynamics
 import json
 import asyncio
 import concurrent.futures
+import random
 import time
 from typing import Any, Dict, List, Optional
 
-from ncatbot.types import MessageArray,Reply,PlainText,At
+from ncatbot.types import MessageArray,Reply,PlainText,At,Image
 
 
 def _patch_hindsight_run_async() -> None:
@@ -63,20 +65,25 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "send_message",
-            "description": "向当前群聊发送一条消息",
+            "description": (
+                "向当前群聊发送一条消息。"
+                "如果想沉默，直接不调用本工具即可。"
+                "只有在你真的想说点什么时才调用。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "要发送给用户的消息内容",
+                        "description": "要发送的消息内容",
                     },
                     "reply": {
                         "type": "boolean",
-                        "description": "是否回复当前用户的消息；true 为回复，false 为不回复",
+                        "description": "是否对当前用户的消息做 reply 引用（艾特气泡）。",
+                        "default": False,
                     },
                 },
-                "required": ["content", "reply"],
+                "required": ["content"],
             },
         },
     },
@@ -96,55 +103,136 @@ class AIPlugin(NcatBotPlugin):
     assistent_messages: List[Dict[str, str]] = []  # 用于存储上下文
     max_k: int = 60  # 历史消息缓存上限
     dynamic_k: int = 40  # 温度动态调节的基准上下文窗口
+    _bg_task: Optional[asyncio.Task[None]] = None
 
     async def on_load(self) -> None:
         self.assistent_messages = []
         self.temperature_controller = TemperatureController(window_max=self.dynamic_k)
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
-        #self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}") 
+        #self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}")
         _patch_hindsight_run_async()
         hindsight_litellm.configure(hindsight_api_url=f"http://localhost:{self.hindsight_port}")
         hindsight_litellm.set_defaults(bank_id="default-bank")  # 设置一个默认值
         hindsight_litellm.enable()
         info = await self.api.qq.query.get_login_info()
         self.bot_id = info.user_id
+        # 社交动力学：决定『要不要回』
+        self.persona = SocialDynamics()
+        self.persona.set_bot_id(str(self.bot_id))
+        # 统计：用于评估拟人度
+        self._stats = {"prompt": 0, "replied": 0, "skipped": 0}
+        # 主动说话心跳任务（重载时先取消旧的，避免协程堆积）
+        if self._bg_task is not None and not self._bg_task.done():
+            self._bg_task.cancel()
+        self._bg_task = asyncio.create_task(self._proactive_loop())
 
     @registrar.qq.on_group_message()
     async def ai_chat(self, event: GroupMessageEvent) -> None:
-        """简单 AI 对话：ai 你好
-        prompt 由自动参数绑定提取，缺失时框架自动回复用法。
-        """
+        """AI 对话：动力学决定『要不要回』，LLM 决定『说什么』"""
         if not self.is_target_group(event.group_id):
             return
-        if event.message.text.strip() == "":
-            return
-        at_list = event.message.filter_at()
-        is_at_me = any(str(at.user_id) == self.bot_id for at in at_list)
-        user_name = await self.get_user_name(event.user_id)
-        user_message = f"{user_name}: {event.message.text}"
-        now = time.monotonic()
-        temperature = self.temperature_controller.current_temperature(now)
-        if self.temperature_controller.should_reheat(user_message, temperature, now):
-            temperature = self.temperature_controller.reheat(now)
-        context_window = self.temperature_controller.temperature_to_window(temperature)
-        IS_AT_SYSTEM_PROMPT = ("(你被 @ 了，此条必须回复)" if is_at_me else "\n\n(你没有被 @，可以选择不回复)")
-        system_chat = [
-              {"role": "system", "content": SYSTEM_PROMPT + IS_AT_SYSTEM_PROMPT}]
-        user_chat = [{"role": "user", "content":user_message},]
-        resp = await self.api.ai.chat(
-        system_chat + self.assistent_messages[-context_window:] + user_chat,
-        tools=TOOLS_SCHEMA,
-        tool_choice={
-            "type": "function",
-            "function": {"name": "send_message"},
-        },
-        hindsight_bank_id=event.user_id)
-        message = resp.choices[0].message
-        if not message.tool_calls:
+        raw_text = event.message.text.strip()
+        if not raw_text:
             return
 
-        content = "" # 作用域
+        gid = str(event.group_id)
+        uid = str(event.user_id)
+        now = time.monotonic()
+        self._stats["prompt"] += 1
+
+        at_list = event.message.filter_at()
+        is_at_me = any(str(at.user_id) == self.bot_id for at in at_list)
+        has_image = bool(event.message.filter(Image))
+
+        # 1) 把消息喂给动力学
+        self.persona.on_incoming_message(
+            group_id=gid,
+            user_id=uid,
+            text=raw_text,
+            has_image=has_image,
+            is_at_me=is_at_me,
+            now=now,
+        )
+
+        # 2) 求解『该不该回』
+        should_reply, decision_info = self.persona.decide_reply(
+            group_id=gid,
+            user_id=uid,
+            text=raw_text,
+            has_image=has_image,
+            is_at_me=is_at_me,
+            now=now,
+        )
+
+        if not should_reply:
+            self._stats["skipped"] += 1
+            self.persona.on_self_skipped(gid, uid)
+            # 把『我选择沉默』记录进上下文，避免模型下一轮重复尝试
+            self.assistent_messages.append(
+                {"role": "assistant", "content": "...（已读未回）"}
+            )
+            if len(self.assistent_messages) > self.max_k:
+                self.assistent_messages = self.assistent_messages[-self.max_k:]
+            return
+
+        # 3) 准备 prompt
+        user_name = await self.get_user_name(event.user_id)
+        user_message = await self.resolve_message(event.message)
+        if not user_message.strip():
+            return
+        prefixed = f"{user_name}: {user_message}"
+
+        temperature = self.temperature_controller.current_temperature(now)
+        if self.temperature_controller.should_reheat(prefixed, temperature, now):
+            temperature = self.temperature_controller.reheat(now)
+        context_window = self.temperature_controller.temperature_to_window(temperature)
+
+        target_len = self.persona.target_length(gid, uid, now)
+
+        decision_ctx = (
+            f"\n[动力学状态] "
+            f"决定概率 p={decision_info.get('p', 0):.2f} z={decision_info.get('z', 0):.1f}\n"
+            f"attention={decision_info['attention']:.2f} "
+            f"energy={decision_info['energy']:.2f} "
+            f"mood={decision_info['mood']:+.2f} "
+            f"arousal={decision_info['arousal']:.2f}\n"
+            f"对 {user_name}：affection={decision_info['affection']:.2f} "
+            f"trust={decision_info['trust']:.2f} "
+            f"fatigue={decision_info['fatigue']:.2f}\n"
+            f"目标回复长度 ≤ {target_len} 字\n"
+            + ("(你被 @ 了，此条必须回复)\n" if is_at_me
+               else "(按动力学结果：可能回也可能不回)\n")
+        )
+
+        system_chat = [
+            {"role": "system", "content": SYSTEM_PROMPT + decision_ctx}
+        ]
+        user_chat = [{"role": "user", "content": prefixed}]
+
+        resp = await self.api.ai.chat(
+            system_chat + self.assistent_messages[-context_window:] + user_chat,
+            tools=TOOLS_SCHEMA,
+            tool_choice={
+                "type": "function",
+                "function": {"name": "send_message"},
+            },
+            hindsight_bank_id=uid,
+        )
+        message = resp.choices[0].message
+        if not message.tool_calls:
+            # 模型自己选择沉默
+            self._stats["skipped"] += 1
+            self.persona.on_self_skipped(gid, uid)
+            self.assistent_messages.append(
+                {"role": "assistant", "content": "...（已读未回）"}
+            )
+            if len(self.assistent_messages) > self.max_k:
+                self.assistent_messages = self.assistent_messages[-self.max_k:]
+            return
+
+        # 4) 处理工具调用
+        content = ""
         for tool_call in message.tool_calls:
             if tool_call.function.name != "send_message":
                 continue
@@ -153,22 +241,101 @@ class AIPlugin(NcatBotPlugin):
             except json.JSONDecodeError:
                 self.logger.warning("send_message 参数不是有效 JSON")
                 continue
-            content = arguments.get("content")
-            reply = arguments.get("reply")
-            if isinstance(content, str) and content.strip() and isinstance(reply, bool):
-                await self.send_message(event, content, reply)
+            raw_content = arguments.get("content") or ""
+            reply_flag = bool(arguments.get("reply", False))
+
+            if not raw_content.strip():
+                continue
+
+            # 复读检测：命中就再生成一次（注入禁忌）
+            if self.persona.is_repeating(gid, raw_content):
+                # 简单做法：补一句前缀
+                raw_content = "嗯…" + raw_content
+
+            # 风格化
+            styled = self.persona.stylize(raw_content, gid, now)
+
+            # 打字延迟
+            delay = self.persona.typing_latency(gid, len(styled), now)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            await self.send_message(event, styled, reply_flag)
+
+            # 记录动力学状态
+            self.persona.on_self_spoke(gid, uid, styled, now)
+            self._stats["replied"] += 1
+            content = styled
+
         self.add_assistent_message(
-            bot_content= content if isinstance(content,str) else "",
+            bot_content=content,
             user_id=event.user_id,
-            message=user_message,
+            message=prefixed,
         )
+
+    async def _proactive_loop(self) -> None:
+        """主动说话心跳：不依赖用户消息"""
+        while True:
+            # 20~90 分钟一醒
+            await asyncio.sleep(random.uniform(1200, 5400))
+            try:
+                gid = str(self.target_group_id)
+                now = time.monotonic()
+                impulse = self.persona.proactive_impulse(gid, now)
+                if random.random() > impulse:
+                    continue
+                if not self.assistent_messages:
+                    continue
+                # 让模型自创一句
+                prompt_msgs = [
+                    {"role": "system", "content": SYSTEM_PROMPT
+                        + "\n[模式] 主动发起话题。随便说点啥——想起的事、对群友的吐槽、自嘲。不要太长。≤24字。"}
+                ] + self.assistent_messages[-8:]
+                resp = await self.api.ai.chat(
+                    prompt_msgs,
+                    tools=TOOLS_SCHEMA,
+                    tool_choice={"type": "function", "function": {"name": "send_message"}},
+                    hindsight_bank_id="self",
+                )
+                msg = resp.choices[0].message
+                if not msg.tool_calls:
+                    continue
+                for tc in msg.tool_calls:
+                    if tc.function.name != "send_message":
+                        continue
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        continue
+                    content = self.persona.stylize(args.get("content", "") or "", gid, now)
+                    if not content.strip():
+                        continue
+                    if self.persona.is_repeating(gid, content):
+                        continue
+                    delay = self.persona.typing_latency(gid, len(content), now)
+                    await asyncio.sleep(delay)
+                    await self.api.qq.send_group_text(self.target_group_id, content)
+                    self.persona.on_self_spoke(gid, "self", content, now)
+                    self.add_assistent_message(
+                        bot_content=content,
+                        user_id="self",
+                        message="bot(主动): "+content,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.warning("proactive loop error: %s", e)
 
     async def send_message(
         self, event: GroupMessageEvent, content: str, reply: bool
     ) -> None:
-        """向当前群聊发送消息，可选择是否回复当前消息。"""
-        if reply:
-            await self.api.qq.send_group_text(event.group_id, content)
+        """向当前群聊发送消息，可选择是否回复当前消息。
+
+        当前 ncatbot 没有 reply 引用接口，先退化为普通发。
+        """
+        if not content.strip():
+            return
+        await self.api.qq.send_group_text(event.group_id, content)
     def is_target_group(self, group_id: int | str) -> bool:
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
