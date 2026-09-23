@@ -50,8 +50,9 @@ SOUL_PROMPT = (Path(__file__).resolve().parent / "SOUL.txt").read_text(
     encoding="utf-8"
 )
 
-SYSTEM_PROMPT = \
+SYSTEM_PROMPT = SOUL_PROMPT + \
 """
+
 GUIDELINES:
 发送消息时，必须调用 send_message 工具；任何直接输出的文字都会被忽略，不会作为消息内容发送。
 你可以自行决定是否调用 send_message 工具，或者直接忽略用户消息。不需要每一条都回复，像人一样选择性回复就行。
