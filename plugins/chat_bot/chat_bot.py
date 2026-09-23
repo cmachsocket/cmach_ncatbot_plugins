@@ -82,6 +82,77 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
 ]
 
+
+class TemperatureController:
+    """按真实时间控制温度、上下文窗口和重加热。"""
+
+    def __init__(
+        self,
+        window_max: int = 40,
+        window_min: int = 4,
+        temperature_initial: float = 1.0,
+        temperature_max: float = 1.5,
+        temperature_min: float = 0.05,
+        temperature_tau: float = 1800.0,
+        reheat_multiplier: float = 4.0,
+        reheat_cooldown: float = 60.0,
+    ) -> None:
+        self.window_max = window_max
+        self.window_min = window_min
+        self.temperature_initial = temperature_initial
+        self.temperature_max = temperature_max
+        self.temperature_min = temperature_min
+        self.temperature_tau = temperature_tau
+        self.reheat_multiplier = reheat_multiplier
+        self.reheat_cooldown = reheat_cooldown
+        self.temperature_base = temperature_initial
+        self.temperature_base_time = time.monotonic()
+        self.last_reheat_time = 0.0
+
+    def current_temperature(self, now: float | None = None) -> float:
+        if now is None:
+            now = time.monotonic()
+        elapsed = max(0.0, now - self.temperature_base_time)
+        return self.temperature_min + (
+            self.temperature_base - self.temperature_min
+        ) * math.exp(-elapsed / self.temperature_tau)
+
+    def temperature_to_window(self, temperature: float) -> int:
+        temperature = max(self.temperature_min, min(self.temperature_max, temperature))
+        position = (
+            math.log(temperature) - math.log(self.temperature_min)
+        ) / (
+            math.log(self.temperature_initial) - math.log(self.temperature_min)
+        )
+        position = max(0.0, min(1.0, position))
+        window = self.window_min + position * (self.window_max - self.window_min)
+        return min(self.window_max, max(self.window_min, int(window)))
+
+    def reheat(self, now: float | None = None) -> float:
+        if now is None:
+            now = time.monotonic()
+        temperature = self.current_temperature(now)
+        self.temperature_base = min(
+            self.temperature_max, self.reheat_multiplier * temperature
+        )
+        self.temperature_base_time = now
+        self.last_reheat_time = now
+        return self.temperature_base
+
+    def should_reheat(
+        self, message: str, temperature: float, now: float | None = None
+    ) -> bool:
+        if now is None:
+            now = time.monotonic()
+        if now - self.last_reheat_time < self.reheat_cooldown:
+            return False
+        old_memory_markers = ("之前", "刚才", "上次", "记得", "忘了", "忘记")
+        complex_query = len(message) >= 80 or any(
+            marker in message for marker in old_memory_markers
+        )
+        return complex_query and temperature <= self.temperature_max * 0.65
+
+
 class AIHelloWorldPlugin(NcatBotPlugin):
     """AI 适配器基础用法示例"""
 
@@ -93,22 +164,10 @@ class AIHelloWorldPlugin(NcatBotPlugin):
     assistent_messages: List[Dict[str, str]]  # 用于存储上下文
     max_k = 60  # 历史消息缓存上限
     dynamic_k = 40  # 温度动态调节的基准上下文窗口
-    temperature_initial = 1.0
-    temperature_max = 1.5
-    temperature_min = 0.05
-    temperature_tau = 1800.0
-    reheat_multiplier = 4.0
-    reheat_cooldown = 60.0
-    window_min = 4
-    temperature_base = temperature_initial
-    temperature_base_time = 0.0
-    last_reheat_time = 0.0
 
     async def on_load(self) -> None:
         self.assistent_messages = []
-        self.temperature_base = self.temperature_initial
-        self.temperature_base_time = time.monotonic()
-        self.last_reheat_time = 0.0
+        self.temperature_controller = TemperatureController(window_max=self.dynamic_k)
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
         #self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}") 
@@ -133,10 +192,10 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         user_name = await self.get_user_name(event.user_id)
         user_message = f"{user_name}: {event.message.text}"
         now = time.monotonic()
-        temperature = self.current_temperature(now)
-        if self.should_reheat(user_message, temperature, now):
-            temperature = self.reheat(now)
-        context_window = self.temperature_to_window(temperature)
+        temperature = self.temperature_controller.current_temperature(now)
+        if self.temperature_controller.should_reheat(user_message, temperature, now):
+            temperature = self.temperature_controller.reheat(now)
+        context_window = self.temperature_controller.temperature_to_window(temperature)
         IS_AT_SYSTEM_PROMPT = ("(你被 @ 了，此条必须回复)" if is_at_me else "\n\n(你没有被 @，可以选择不回复)")
         system_chat = [
               {"role": "system", "content": SYSTEM_PROMPT + IS_AT_SYSTEM_PROMPT}]
@@ -171,53 +230,6 @@ class AIHelloWorldPlugin(NcatBotPlugin):
             user_id=event.user_id,
             message=user_message,
         )
-
-    def current_temperature(self, now: float | None = None) -> float:
-        """按真实经过时间计算当前温度。"""
-        if now is None:
-            now = time.monotonic()
-        elapsed = max(0.0, now - self.temperature_base_time)
-        return self.temperature_min + (
-            self.temperature_base - self.temperature_min
-        ) * math.exp(-elapsed / self.temperature_tau)
-
-    def temperature_to_window(self, temperature: float) -> int:
-        """把温度按对数映射到历史消息窗口。"""
-        temperature = max(self.temperature_min, min(self.temperature_max, temperature))
-        position = (
-            math.log(temperature) - math.log(self.temperature_min)
-        ) / (
-            math.log(self.temperature_initial) - math.log(self.temperature_min)
-        )
-        position = max(0.0, min(1.0, position))
-        window = self.window_min + position * (self.dynamic_k - self.window_min)
-        return min(self.dynamic_k, max(self.window_min, int(window)))
-
-    def reheat(self, now: float | None = None) -> float:
-        """以当前温度为基础短暂升温，并重置衰减起点。"""
-        if now is None:
-            now = time.monotonic()
-        temperature = self.current_temperature(now)
-        self.temperature_base = min(
-            self.temperature_max, self.reheat_multiplier * temperature
-        )
-        self.temperature_base_time = now
-        self.last_reheat_time = now
-        return self.temperature_base
-
-    def should_reheat(
-        self, message: str, temperature: float, now: float | None = None
-    ) -> bool:
-        """长问题或明确追问旧信息时，在冷却期后触发重加热。"""
-        if now is None:
-            now = time.monotonic()
-        if now - self.last_reheat_time < self.reheat_cooldown:
-            return False
-        old_memory_markers = ("之前", "刚才", "上次", "记得", "忘了", "忘记")
-        complex_query = len(message) >= 80 or any(
-            marker in message for marker in old_memory_markers
-        )
-        return complex_query and temperature <= self.temperature_max * 0.65
 
     async def send_message(
         self, event: GroupMessageEvent, content: str, reply: bool
