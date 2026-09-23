@@ -428,30 +428,6 @@ class SocialDynamics:
         return min(think + type_t, 15.0)
 
     # ------------------------------------------------------------------
-    # 决策：目标回复长度
-    # ------------------------------------------------------------------
-    def target_length(
-        self,
-        group_id: str,
-        user_id: str,
-        now: Optional[float] = None,
-    ) -> int:
-        now = now if now is not None else time.monotonic()
-        g = self.groups[group_id]
-        aff = g.affection.get(user_id, 0.4)
-
-        base = self._rng.gauss(10, 4)
-        base += 8 * aff
-        if abs(g.mood) > 0.6:
-            base -= 4
-        base *= 0.5 + 0.5 * g.energy
-        # 深夜：本能更短
-        hour = time.localtime(now).tm_hour
-        if 0 <= hour < 7:
-            base *= 0.6
-        return max(2, min(45, int(base)))
-
-    # ------------------------------------------------------------------
     # 复读抑制
     # ------------------------------------------------------------------
     def is_repeating(self, group_id: str, content: str) -> bool:

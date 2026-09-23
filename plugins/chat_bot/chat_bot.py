@@ -188,9 +188,7 @@ class AIPlugin(NcatBotPlugin):
             temperature = self.temperature_controller.reheat(now)
         context_window = self.temperature_controller.temperature_to_window(temperature)
 
-        target_len = self.persona.target_length(gid, uid, now)
-
-        decision_ctx = self._build_decision_ctx(decision_info, is_at_me, target_len, user_name)
+        decision_ctx = self._build_decision_ctx(decision_info, is_at_me, user_name)
 
         system_chat = [
             {"role": "system", "content": SYSTEM_PROMPT + decision_ctx}
@@ -305,12 +303,10 @@ class AIPlugin(NcatBotPlugin):
                     continue
                 if not self.assistent_messages:
                     continue
-                # 让模型自创一句。目标长度由 persona 计算，与被动回复保持一致。
-                target_len = self.persona.target_length(gid, "self", now)
+                # 让模型自创一句
                 prompt_msgs = [
                     {"role": "system", "content": SYSTEM_PROMPT
-                        + f"\n[模式] 主动发起话题。随便说点啥——想起的事、对群友的吐槽、自嘲。"
-                        + f"\n目标长度 ≤ {target_len} 字。"}
+                        + "\n[模式] 主动发起话题。随便说点啥——想起的事、对群友的吐槽、自嘲。"}
                 ] + self.assistent_messages[-8:]
                 resp = await self.api.ai.chat(
                     prompt_msgs,
@@ -319,6 +315,7 @@ class AIPlugin(NcatBotPlugin):
                     hindsight_bank_id="self",
                 )
                 msg = resp.choices[0].message
+                LOG.info(f"AI content:{resp.choices[0].message.content}")
                 if not msg.tool_calls:
                     continue
                 for tc in msg.tool_calls:
@@ -365,7 +362,6 @@ class AIPlugin(NcatBotPlugin):
         self,
         decision_info: dict[str, Any],
         is_at_me: bool,
-        target_len: int,
         user_name: str,
     ) -> str:
         """把动力学的数值状态翻译成自然语言描述，给 LLM 看。
@@ -419,7 +415,7 @@ class AIPlugin(NcatBotPlugin):
         parts = [energy_desc + "，", mood_desc + "。", rel_desc + "。"]
         if fatigue_desc:
             parts.append(fatigue_desc + "。")
-        parts.append(f"{must_desc}。长度别超过 {target_len} 字。")
+        parts.append(f"{must_desc}。")
 
         return "\n[内心状态] " + " ".join(parts) + "\n"
     def add_assistent_message(self, bot_content: str, user_id: str, message: str) -> None:
@@ -440,6 +436,8 @@ class AIPlugin(NcatBotPlugin):
     async def get_user_name(self, user_id: int | str) -> str:
         """查询用户在该群的显示名，优先群昵称，回退到 QQ 昵称"""
         try:
+            if(user_id == "all"):
+                return "全体成员"
             member_info = await self.api.qq.query.get_group_member_info(
                 self.target_group_id, user_id
             )
