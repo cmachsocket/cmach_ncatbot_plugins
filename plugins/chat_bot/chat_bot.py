@@ -2,8 +2,8 @@ from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 import hindsight_litellm
-from time_controller import TemperatureController
-from persona import SocialDynamics
+from .time_controller import TemperatureController
+from .persona import SocialDynamics
 import json
 import asyncio
 import concurrent.futures

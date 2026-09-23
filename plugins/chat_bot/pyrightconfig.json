@@ -1,0 +1,12 @@
+{
+    "extraPaths": [
+        "/home/cmach_socket/uvenv/lib/python3.14/site-packages"
+    ],
+    "pythonVersion": "3.14",
+    "reportMissingImports": "error",
+    "reportOptionalMemberAccess": "error",
+    "reportAttributeAccessIssue": "error",
+    "reportOptionalSubscript": "error",
+    "reportGeneralTypeIssues": "error",
+    "reportMissingTypeStubs": "none"
+}
