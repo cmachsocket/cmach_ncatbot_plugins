@@ -111,6 +111,7 @@ class SocialDynamics:
         self.groups: dict[str, GroupDynamics] = defaultdict(GroupDynamics)
         self._rng = random.Random(seed)
         self._bot_id: str = ""   # 外部调用 set_bot_id() 注入
+        self._said_text: dict[str, list[str]] = {}  # 复读禁忌：原话环形 buffer
 
     def set_bot_id(self, bot_id: str) -> None:
         """让引擎知道自己的 QQ id，用来判断消息里的 @"""
@@ -243,6 +244,9 @@ class SocialDynamics:
 
         g.last_spoke_global = now
         g.last_spoke_to[user_id] = now
+
+        # 复读禁忌：保存原话
+        self.record_said_text(group_id, content)
 
         cost = 0.04 + 0.005 * len(content)
         g.energy = max(0.0, g.energy - cost)
@@ -454,36 +458,19 @@ class SocialDynamics:
         h = hash(self._normalize_for_repeat(content))
         return h in self.groups[group_id].said_recently
 
-    # ------------------------------------------------------------------
-    # 风格化：根据 mood 注入语气
-    # ------------------------------------------------------------------
-    def stylize(self, raw: str, group_id: str, now: Optional[float] = None) -> str:
-        if not raw:
-            return raw
+    def said_samples(self, group_id: str, n: int = 4) -> list[str]:
+        """返回最近说过的若干条原话（去掉重复 hash 的不可逆信息），供 prompt 注入禁忌。"""
         g = self.groups[group_id]
-        out = raw
+        # said_recently 存的是 hash，无法逆推原话
+        # 因此这里依赖外部在 on_self_spoke 时把原话存到一个环形 buffer。
+        return list(self._said_text.get(group_id, []))[-n:]
 
-        if g.mood > 0.3 and self._rng.random() < 0.4:
-            out = self._rng.choice(
-                ["诶嘿嘿，", "哈哈哈，", "哇~", "嗯哼，"]
-            ) + out
-        elif g.mood < -0.3 and self._rng.random() < 0.5:
-            out = self._rng.choice(
-                ["啧，", "切，", "哼，", "烦诶，"]
-            ) + out
-
-        if self._rng.random() < 0.35:
-            out += self._rng.choice(["~", "（得意）", "（哼）", "！", "…", ""])
-
-        if self._rng.random() < 0.18:
-            swaps = [
-                ("什么", "啥"), ("这样", "酱"), ("知道", "知"),
-                ("不会", "不会吧"), ("可以", "阔以"),
-            ]
-            for a, b in swaps:
-                if a in out and self._rng.random() < 0.5:
-                    out = out.replace(a, b)
-        return out
+    def record_said_text(self, group_id: str, text: str) -> None:
+        """外部在 self.on_self_spoke 后调一下，把原话存进来用于复读禁忌。"""
+        buf = self._said_text.setdefault(group_id, [])
+        buf.append(text)
+        if len(buf) > 16:
+            del buf[:-16]
 
     # ------------------------------------------------------------------
     # 调试

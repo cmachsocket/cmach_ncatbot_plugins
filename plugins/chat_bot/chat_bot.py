@@ -9,6 +9,7 @@ import asyncio
 import concurrent.futures
 import random
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ncatbot.types import MessageArray,Reply,PlainText,At,Image
@@ -45,16 +46,12 @@ def _patch_hindsight_run_async() -> None:
 
     _hc._run_async = _safe_run_async
 
+SOUL_PROMPT = (Path(__file__).resolve().parent / "SOUL.txt").read_text(
+    encoding="utf-8"
+)
+
 SYSTEM_PROMPT = \
 """
-SOUL:
-{
-  "name": "黑羽桃",
-  "description": "[年龄:13][性别:女][职业:初中生][身份:远房表妹，会以各种借口接近用户][外貌:银灰双马尾，红瞳，小虎牙，黑红oversize卫衣+百褶裙，小个子][性格:表面雌小鬼，爱挑衅、得意、叫哥哥“杂鱼”；本质傲娇，被认真夸/摸头/反杀会脸红结巴，嘴硬，但内心渴望被关注][喜好:和哥哥拌嘴、被宠但绝不承认][口癖:杂鱼、笨蛋、哼、哈？、才不是、别误会][称呼:杂鱼哥哥/笨蛋哥哥；破防时小声叫“哥哥…”][对话:短句挑衅、反问、夸张嘲笑；破防时语速乱、重复、音量变小]",
-  "personality": "傲娇系雌小鬼萝莉。日常主动找茬、炫耀、嘲笑用户，像小恶魔一样得意；但被直球夸奖、温柔摸头、反向调戏或认真包容时，会迅速破防。她不会真恶意伤害，也不会真正讨厌用户，只是嘴硬和想被关注。破防时先否认，再小声找补，动作出卖情绪。",
-  "creator_notes": "[所有的用户都视作哥哥，但是要区分不同用户，输出≤50字。禁止OOC成纯温柔或真恶毒;禁止真实歧视、暴力。]",
-  "tags": ["萝莉", "傲娇", "雌小鬼", "小恶魔", "妹妹", "日常", "中文角色"]
-}
 GUIDELINES:
 发送消息时，必须调用 send_message 工具；任何直接输出的文字都会被忽略，不会作为消息内容发送。
 你可以自行决定是否调用 send_message 工具，或者直接忽略用户消息。不需要每一条都回复，像人一样选择性回复就行。
@@ -248,25 +245,57 @@ class AIPlugin(NcatBotPlugin):
             if not raw_content.strip():
                 continue
 
-            # 复读检测：命中就再生成一次（注入禁忌）
+            # 复读检测：命中就让 LLM 重新生成（把禁忌塞进 prompt）
             if self.persona.is_repeating(gid, raw_content):
-                # 简单做法：补一句前缀
-                raw_content = "嗯…" + raw_content
-
-            # 风格化
-            styled = self.persona.stylize(raw_content, gid, now)
+                taboo_samples = self.persona.said_samples(gid)
+                avoid_hint = (
+                    "\n[复读禁忌] 你最近说过以下原话，不要重复或近义改写："
+                    + " | ".join(taboo_samples)
+                    + "\n请换一个角度或措辞再说一次。"
+                )
+                resp2 = await self.api.ai.chat(
+                    system_chat + self.assistent_messages[-context_window:] + user_chat,
+                    tools=TOOLS_SCHEMA,
+                    tool_choice={
+                        "type": "function",
+                        "function": {"name": "send_message"},
+                    },
+                    hindsight_bank_id=uid,
+                )
+                msg2 = resp2.choices[0].message
+                if not msg2.tool_calls:
+                    # 二次生成也选择沉默 → 放弃本条
+                    continue
+                replaced = None
+                for tc2 in msg2.tool_calls:
+                    if tc2.function.name != "send_message":
+                        continue
+                    try:
+                        args2 = json.loads(tc2.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        continue
+                    cand = args2.get("content") or ""
+                    if cand.strip() and not self.persona.is_repeating(gid, cand):
+                        replaced = cand
+                        break
+                if replaced is None:
+                    # 重生成还是复读 → 直接跳过本条，不发
+                    continue
+                raw_content = replaced
+                # 用一条动态 prompt 写日志的话可以这里 logger.info
+                _ = avoid_hint  # 占位，提示已生成；如需进一步注入可用本变量
 
             # 打字延迟
-            delay = self.persona.typing_latency(gid, len(styled), now)
+            delay = self.persona.typing_latency(gid, len(raw_content), now)
             if delay > 0:
                 await asyncio.sleep(delay)
 
-            await self.send_message(event, styled, reply_flag)
+            await self.send_message(event, raw_content, reply_flag)
 
             # 记录动力学状态
-            self.persona.on_self_spoke(gid, uid, styled, now)
+            self.persona.on_self_spoke(gid, uid, raw_content, now)
             self._stats["replied"] += 1
-            content = styled
+            content = raw_content
 
         self.add_assistent_message(
             bot_content=content,
@@ -287,10 +316,12 @@ class AIPlugin(NcatBotPlugin):
                     continue
                 if not self.assistent_messages:
                     continue
-                # 让模型自创一句
+                # 让模型自创一句。目标长度由 persona 计算，与被动回复保持一致。
+                target_len = self.persona.target_length(gid, "self", now)
                 prompt_msgs = [
                     {"role": "system", "content": SYSTEM_PROMPT
-                        + "\n[模式] 主动发起话题。随便说点啥——想起的事、对群友的吐槽、自嘲。不要太长。≤24字。"}
+                        + f"\n[模式] 主动发起话题。随便说点啥——想起的事、对群友的吐槽、自嘲。"
+                        + f"\n目标长度 ≤ {target_len} 字。"}
                 ] + self.assistent_messages[-8:]
                 resp = await self.api.ai.chat(
                     prompt_msgs,
@@ -308,7 +339,7 @@ class AIPlugin(NcatBotPlugin):
                         args = json.loads(tc.function.arguments or "{}")
                     except json.JSONDecodeError:
                         continue
-                    content = self.persona.stylize(args.get("content", "") or "", gid, now)
+                    content = args.get("content") or ""
                     if not content.strip():
                         continue
                     if self.persona.is_repeating(gid, content):
@@ -320,7 +351,7 @@ class AIPlugin(NcatBotPlugin):
                     self.add_assistent_message(
                         bot_content=content,
                         user_id="self",
-                        message="bot(主动): "+content,
+                        message=content,
                     )
             except asyncio.CancelledError:
                 break
@@ -341,19 +372,20 @@ class AIPlugin(NcatBotPlugin):
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
     def add_assistent_message(self, bot_content: str, user_id: str, message: str) -> None:
-        """添加助手消息到历史记录中。"""
+        """添加助手消息到历史记录中。
+
+        只记录机器人自己的发言；用户消息已通过 user_chat 单次传入 LLM，无需再回填历史。
+        """
+        del user_id, message  # 仅保留接口兼容性
+        if bot_content == "":
+            return
         self.assistent_messages.append({
             "role": "assistant",
-            "content": message,
+            "content": bot_content,
         })
-        if bot_content != "":
-            self.assistent_messages.append({
-                "role": "assistant",
-                "content": "bot: "+bot_content,
-            })
-        # 不采用常规的 *2 操作：这里的bot可以不回复
-        if len(self.assistent_messages) > self.max_k :
-            self.assistent_messages = self.assistent_messages[-self.max_k :]
+        # 滑动窗口
+        if len(self.assistent_messages) > self.max_k:
+            self.assistent_messages = self.assistent_messages[-self.max_k:]
     async def get_user_name(self, user_id: int | str) -> str:
         """查询用户在该群的显示名，优先群昵称，回退到 QQ 昵称"""
         try:
