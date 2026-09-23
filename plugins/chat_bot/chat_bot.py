@@ -4,9 +4,11 @@ from ncatbot.plugin import NcatBotPlugin
 import hindsight_litellm
 from hindsight_client import Hindsight
 from datetime import datetime
+import math
 import json
 import asyncio
 import concurrent.futures
+import time
 from typing import Any, Dict, List
 
 
@@ -89,8 +91,24 @@ class AIHelloWorldPlugin(NcatBotPlugin):
     target_group_id = 1093424135
     bot_id = None
     assistent_messages: List[Dict[str, str]]  # 用于存储上下文
+    max_k = 60  # 历史消息缓存上限
+    dynamic_k = 40  # 温度动态调节的基准上下文窗口
+    temperature_initial = 1.0
+    temperature_max = 1.5
+    temperature_min = 0.05
+    temperature_tau = 1800.0
+    reheat_multiplier = 4.0
+    reheat_cooldown = 60.0
+    window_min = 4
+    temperature_base = temperature_initial
+    temperature_base_time = 0.0
+    last_reheat_time = 0.0
+
     async def on_load(self) -> None:
         self.assistent_messages = []
+        self.temperature_base = self.temperature_initial
+        self.temperature_base_time = time.monotonic()
+        self.last_reheat_time = 0.0
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
         #self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}") 
@@ -108,15 +126,23 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         """
         if not self.is_target_group(event.group_id):
             return
+        if event.message.text.strip() == "":
+            return
         at_list = event.message.filter_at()
         is_at_me = any(str(at.user_id) == self.bot_id for at in at_list)
         user_name = await self.get_user_name(event.user_id)
         user_message = f"{user_name}: {event.message.text}"
+        now = time.monotonic()
+        temperature = self.current_temperature(now)
+        if self.should_reheat(user_message, temperature, now):
+            temperature = self.reheat(now)
+        context_window = self.temperature_to_window(temperature)
         IS_AT_SYSTEM_PROMPT = ("(你被 @ 了，此条必须回复)" if is_at_me else "\n\n(你没有被 @，可以选择不回复)")
-        resp = await self.api.ai.chat([
-              {"role": "system", "content": SYSTEM_PROMPT + IS_AT_SYSTEM_PROMPT},
-              {"role": "user", "content":user_message},
-              ],
+        system_chat = [
+              {"role": "system", "content": SYSTEM_PROMPT + IS_AT_SYSTEM_PROMPT}]
+        user_chat = [{"role": "user", "content":user_message},]
+        resp = await self.api.ai.chat(
+        system_chat + self.assistent_messages[-context_window:] + user_chat,
         tools=TOOLS_SCHEMA,
         tool_choice={
             "type": "function",
@@ -146,6 +172,53 @@ class AIHelloWorldPlugin(NcatBotPlugin):
             message=user_message,
         )
 
+    def current_temperature(self, now: float | None = None) -> float:
+        """按真实经过时间计算当前温度。"""
+        if now is None:
+            now = time.monotonic()
+        elapsed = max(0.0, now - self.temperature_base_time)
+        return self.temperature_min + (
+            self.temperature_base - self.temperature_min
+        ) * math.exp(-elapsed / self.temperature_tau)
+
+    def temperature_to_window(self, temperature: float) -> int:
+        """把温度按对数映射到历史消息窗口。"""
+        temperature = max(self.temperature_min, min(self.temperature_max, temperature))
+        position = (
+            math.log(temperature) - math.log(self.temperature_min)
+        ) / (
+            math.log(self.temperature_initial) - math.log(self.temperature_min)
+        )
+        position = max(0.0, min(1.0, position))
+        window = self.window_min + position * (self.dynamic_k - self.window_min)
+        return min(self.dynamic_k, max(self.window_min, int(window)))
+
+    def reheat(self, now: float | None = None) -> float:
+        """以当前温度为基础短暂升温，并重置衰减起点。"""
+        if now is None:
+            now = time.monotonic()
+        temperature = self.current_temperature(now)
+        self.temperature_base = min(
+            self.temperature_max, self.reheat_multiplier * temperature
+        )
+        self.temperature_base_time = now
+        self.last_reheat_time = now
+        return self.temperature_base
+
+    def should_reheat(
+        self, message: str, temperature: float, now: float | None = None
+    ) -> bool:
+        """长问题或明确追问旧信息时，在冷却期后触发重加热。"""
+        if now is None:
+            now = time.monotonic()
+        if now - self.last_reheat_time < self.reheat_cooldown:
+            return False
+        old_memory_markers = ("之前", "刚才", "上次", "记得", "忘了", "忘记")
+        complex_query = len(message) >= 80 or any(
+            marker in message for marker in old_memory_markers
+        )
+        return complex_query and temperature <= self.temperature_max * 0.65
+
     async def send_message(
         self, event: GroupMessageEvent, content: str, reply: bool
     ) -> None:
@@ -157,18 +230,18 @@ class AIHelloWorldPlugin(NcatBotPlugin):
         return str(group_id) == str(self.target_group_id)
     def add_assistent_message(self, bot_content: str, user_id: str, message: str):
         """添加助手消息到历史记录中。"""
-        return
-        # stub中，需要处理过期问题   
         self.assistent_messages.append({
             "role": "assistant",
             "content": message,
         })
-        if bot_content == "":
-            return
-        self.assistent_messages.append({
-            "role": "assistant",
-            "content": bot_content,
-        })
+        if bot_content != "":
+            self.assistent_messages.append({
+                "role": "assistant",
+                "content": "bot: "+bot_content,
+            })
+        # 不采用常规的 *2 操作：这里的bot可以不回复
+        if len(self.assistent_messages) > self.max_k :
+            self.assistent_messages = self.assistent_messages[-self.max_k :]
     async def get_user_name(self, user_id: int | str) -> str:
         """查询用户在该群的显示名，优先群昵称，回退到 QQ 昵称"""
         try:
