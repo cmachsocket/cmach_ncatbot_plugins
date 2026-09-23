@@ -377,8 +377,13 @@ class AIPlugin(NcatBotPlugin):
         reply_msg = "<quote>"
         reply_ids = messages.filter(Reply)
         for reply in reply_ids:
-            name = await self.get_user_name(reply.id)
             message_data=await self.api.qq.query.get_msg(reply.id)
+            if message_data is None:
+                continue
+            if message_data.sender is not None and message_data.sender.user_id is not None:
+                name = await self.get_user_name(message_data.sender.user_id)
+            else:
+                name = "未知用户"
             # get_msg 返回 MessageData，消息段列表位于其 message 属性中。
             reply_msg += f"{name}：{MessageArray.from_list(message_data.message or []).text}\n"
         reply_msg += "</quote>\n"
