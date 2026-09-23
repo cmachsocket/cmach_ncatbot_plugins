@@ -56,6 +56,7 @@ SYSTEM_PROMPT = SOUL_PROMPT + \
 """
 
 GUIDELINES:
+你在一个群聊里面，你收到的消息不一定是发给你的，你需要根据上下文和语境来判断是否回复。
 发送消息时，必须调用 send_message 工具；任何直接输出的文字都会被忽略，不会作为消息内容发送。
 你可以自行决定是否调用 send_message 工具，或者直接忽略用户消息。不需要每一条都回复，像人一样选择性回复就行。
 """
@@ -189,21 +190,7 @@ class AIPlugin(NcatBotPlugin):
 
         target_len = self.persona.target_length(gid, uid, now)
 
-        decision_ctx = (
-            f"\n[动力学状态] "
-            f"决定概率 p={decision_info.get('p', 0):.2f} "
-            f"z={decision_info.get('z', 0):.1f}\n"
-            f"attention={decision_info.get('attention', 0):.2f} "
-            f"energy={decision_info.get('energy', 0):.2f} "
-            f"mood={decision_info.get('mood', 0):+.2f} "
-            f"arousal={decision_info.get('arousal', 0):.2f}\n"
-            f"对 {user_name}：affection={decision_info.get('affection', 0):.2f} "
-            f"trust={decision_info.get('trust', 0):.2f} "
-            f"fatigue={decision_info.get('fatigue', 0):.2f}\n"
-            f"目标回复长度 ≤ {target_len} 字\n"
-            + ("(你被 @ 了，此条必须回复)\n" if is_at_me
-               else "(按动力学结果：可能回也可能不回)\n")
-        )
+        decision_ctx = self._build_decision_ctx(decision_info, is_at_me, target_len, user_name)
 
         system_chat = [
             {"role": "system", "content": SYSTEM_PROMPT + decision_ctx}
@@ -373,6 +360,68 @@ class AIPlugin(NcatBotPlugin):
     def is_target_group(self, group_id: int | str) -> bool:
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
+
+    def _build_decision_ctx(
+        self,
+        decision_info: dict[str, Any],
+        is_at_me: bool,
+        target_len: int,
+        user_name: str,
+    ) -> str:
+        """把动力学的数值状态翻译成自然语言描述，给 LLM 看。
+
+        设计原则：LLM 不应该看到浮点数——只看到『定性』的状态描述，
+        这样不会让它过度模仿数值（比如看到 mood=+0.3 就硬塞颜文字）。
+        数值仍由 persona 内部决策使用。
+        """
+        energy = float(decision_info.get("energy", 0.5))
+        mood = float(decision_info.get("mood", 0.0))
+        affection = float(decision_info.get("affection", 0.4))
+        fatigue = float(decision_info.get("fatigue", 0.0))
+
+        # 能量 → 疲倦度
+        if energy > 0.7:
+            energy_desc = "你现在精神很好"
+        elif energy > 0.4:
+            energy_desc = "你有点累"
+        else:
+            energy_desc = "你现在很疲倦"
+
+        # 情绪 → 心情
+        if mood > 0.3:
+            mood_desc = "心情不错"
+        elif mood > 0.1:
+            mood_desc = "有点小开心"
+        elif mood < -0.3:
+            mood_desc = "心情不太好"
+        elif mood < -0.1:
+            mood_desc = "有点低落"
+        else:
+            mood_desc = "心情一般"
+
+        # 亲密度 → 关系
+        if affection > 0.7:
+            rel_desc = f"你跟 {user_name} 很有好感"
+        elif affection > 0.4:
+            rel_desc = f"你跟 {user_name} 关系不错"
+        else:
+            rel_desc = f"你跟 {user_name} 试图保持友好"
+
+        # 疲劳 → 语气长度提示
+        if fatigue > 0.6:
+            fatigue_desc = "刚才聊得有点多，简短点回就行"
+        else:
+            fatigue_desc = ""
+
+        # 必须回 vs 可不回
+        must_desc = "这条必须回" if is_at_me else "这条可回可不回"
+
+        parts = [energy_desc + "，", mood_desc + "。", rel_desc + "。"]
+        if fatigue_desc:
+            parts.append(fatigue_desc + "。")
+        parts.append(f"{must_desc}。长度别超过 {target_len} 字。")
+
+        return "\n[内心状态] " + " ".join(parts) + "\n"
     def add_assistent_message(self, bot_content: str, user_id: str, message: str) -> None:
         """添加助手消息到历史记录中。
 
@@ -408,7 +457,7 @@ class AIPlugin(NcatBotPlugin):
     async def resolve_message(self, messages: MessageArray) -> str:
         """解析消息内容"""
         message = ""
-        reply_msg = "<quote>"
+        reply_msg = "<quote>\n"
         reply_ids = messages.filter(Reply)
         for reply in reply_ids:
             message_data=await self.api.qq.query.get_msg(reply.id)
