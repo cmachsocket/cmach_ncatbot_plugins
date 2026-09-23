@@ -428,4 +428,5 @@ class AIPlugin(NcatBotPlugin):
             elif isinstance(msg, At):
                 name = await self.get_user_name(msg.user_id)
                 message += f"@{name} "
+        print(f"resolve_message: {message}")
         return message
