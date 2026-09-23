@@ -11,9 +11,11 @@ import random
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from ncatbot.utils import get_log
 
 from ncatbot.types import MessageArray,Reply,PlainText,At,Image
 
+LOG = get_log("AIPlugin")
 
 def _patch_hindsight_run_async() -> None:
     """Monkey patch hindsight_client._run_async to be safe inside a running event loop.
@@ -92,7 +94,6 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
 
 class AIPlugin(NcatBotPlugin):
     """AI 适配器基础用法示例"""
-
     name = "hello_world_ai"
     hindsight: Any = None
     hindsight_port: int = 7071
@@ -428,5 +429,5 @@ class AIPlugin(NcatBotPlugin):
             elif isinstance(msg, At):
                 name = await self.get_user_name(msg.user_id)
                 message += f"@{name} "
-        print(f"resolve_message: {message}")
+        LOG.info(f"resolve_message: {message}")
         return message
