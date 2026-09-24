@@ -168,12 +168,9 @@ class AIPlugin(NcatBotPlugin):
         if not should_reply:
             self._stats["skipped"] += 1
             self.persona.on_self_skipped(gid, uid)
-            # 把『我选择沉默』记录进上下文，避免模型下一轮重复尝试
-            self.assistent_messages.append(
-                {"role": "assistant", "content": "...（已读未回）"}
-            )
-            if len(self.assistent_messages) > self.max_k:
-                self.assistent_messages = self.assistent_messages[-self.max_k:]
+            # 沉默也写一轮对话进历史（用 uid 作占位名，跳过昂贵的
+            # get_user_name/resolve_message），让下一轮上下文保持完整。
+            self.add_context(bot_content="", message=f"{uid}: {raw_text}")
             return
 
         # 3) 准备 prompt
@@ -205,15 +202,12 @@ class AIPlugin(NcatBotPlugin):
             hindsight_bank_id=uid,
         )
         message = resp.choices[0].message
+        LOG.info(f"AI content:{resp.choices[0].message.content}")
         if not message.tool_calls:
             # 模型自己选择沉默
             self._stats["skipped"] += 1
             self.persona.on_self_skipped(gid, uid)
-            self.assistent_messages.append(
-                {"role": "assistant", "content": "...（已读未回）"}
-            )
-            if len(self.assistent_messages) > self.max_k:
-                self.assistent_messages = self.assistent_messages[-self.max_k:]
+            self.add_context(bot_content="", message=prefixed)
             return
 
         # 4) 处理工具调用
@@ -284,9 +278,8 @@ class AIPlugin(NcatBotPlugin):
             self._stats["replied"] += 1
             content = raw_content
 
-        self.add_assistent_message(
+        self.add_context(
             bot_content=content,
-            user_id=event.user_id,
             message=prefixed,
         )
 
@@ -334,9 +327,8 @@ class AIPlugin(NcatBotPlugin):
                     await asyncio.sleep(delay)
                     await self.api.qq.send_group_text(self.target_group_id, content)
                     self.persona.on_self_spoke(gid, "self", content, now)
-                    self.add_assistent_message(
+                    self.add_context(
                         bot_content=content,
-                        user_id="self",
                         message=content,
                     )
             except asyncio.CancelledError:
@@ -418,18 +410,17 @@ class AIPlugin(NcatBotPlugin):
         parts.append(f"{must_desc}。")
 
         return "\n[内心状态] " + " ".join(parts) + "\n"
-    def add_assistent_message(self, bot_content: str, user_id: str, message: str) -> None:
-        """添加助手消息到历史记录中。
+    def add_context(self, bot_content: str, message: str) -> None:
+        """记录一轮对话到上下文历史。
 
-        只记录机器人自己的发言；用户消息已通过 user_chat 单次传入 LLM，无需再回填历史。
+        message 是这一轮用户的发言（已是 "{name}: {text}" 形式）。
+        bot_content 是机器人的回复；空字符串表示机器人选择沉默，
+        此时插入统一占位符 "...（已读未回）"，让对话轮次保持完整，
+        避免 LLM 下一轮重复尝试回复同一条消息。
         """
-        del user_id, message  # 仅保留接口兼容性
-        if bot_content == "":
-            return
-        self.assistent_messages.append({
-            "role": "assistant",
-            "content": bot_content,
-        })
+        self.assistent_messages.append({"role": "user", "content": message})
+        bot_text = bot_content if bot_content else "...（已读未回）"
+        self.assistent_messages.append({"role": "assistant", "content": bot_text})
         # 滑动窗口
         if len(self.assistent_messages) > self.max_k:
             self.assistent_messages = self.assistent_messages[-self.max_k:]
