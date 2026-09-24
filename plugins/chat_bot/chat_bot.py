@@ -2,6 +2,7 @@ from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 import hindsight_litellm
+from regex import F
 from .time_controller import TemperatureController
 from .persona import SocialDynamics
 import json
@@ -57,7 +58,7 @@ SYSTEM_PROMPT = SOUL_PROMPT + \
 
 GUIDELINES:
 你在一个群聊里面，你收到的消息不一定是发给你的，你需要根据上下文和语境来判断是否回复。
-发送消息时，必须调用 send_message 工具；任何直接输出的文字都会被忽略，不会作为消息内容发送。
+发送消息时，**必须**调用 send_message 工具；任何直接输出的文字都会被**完全丢弃**，不会作为消息内容发送!!!
 你可以自行决定是否调用 send_message 工具，或者直接忽略用户消息。不需要每一条都回复，像人一样选择性回复就行。
 """
 
@@ -66,25 +67,21 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "send_message",
-            "description": (
-                "向当前群聊发送一条消息。"
-                "如果想沉默，直接不调用本工具即可。"
-                "只有在你真的想说点什么时才调用。"
-            ),
+            "description": "向当前群聊发送一条消息",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "要发送的消息内容",
+                        "description": "要发送给用户的消息内容",
                     },
                     "reply": {
                         "type": "boolean",
-                        "description": "是否对当前用户的消息做 reply 引用（艾特气泡）。",
+                        "description": "是否回复当前用户的消息；true 为回复，false 为不回复",
                         "default": False,
                     },
                 },
-                "required": ["content"],
+                "required": ["content", "reply"],
             },
         },
     },
@@ -211,75 +208,39 @@ class AIPlugin(NcatBotPlugin):
             return
 
         # 4) 处理工具调用
-        content = ""
+        last_content = ""
         for tool_call in message.tool_calls:
-            if tool_call.function.name != "send_message":
-                continue
             try:
                 arguments = json.loads(tool_call.function.arguments or "{}")
             except json.JSONDecodeError:
                 self.logger.warning("send_message 参数不是有效 JSON")
                 continue
+            if arguments.get("reply") is False:  # 严格只匹配 False，不匹配 None
+                # 模型选择不回复
+                self._stats["skipped"] += 1
+                self.persona.on_self_skipped(gid, uid)
+                self.add_context(bot_content="", message=prefixed)
+                return
+                
             raw_content = arguments.get("content") or ""
-            reply_flag = bool(arguments.get("reply", False))
-
+            
             if not raw_content.strip():
                 continue
-
-            # 复读检测：命中就让 LLM 重新生成（把禁忌塞进 prompt）
-            if self.persona.is_repeating(gid, raw_content):
-                taboo_samples = self.persona.said_samples(gid)
-                avoid_hint = (
-                    "\n[复读禁忌] 你最近说过以下原话，不要重复或近义改写："
-                    + " | ".join(taboo_samples)
-                    + "\n请换一个角度或措辞再说一次。"
-                )
-                resp2 = await self.api.ai.chat(
-                    system_chat + self.assistent_messages[-context_window:] + user_chat,
-                    tools=TOOLS_SCHEMA,
-                    tool_choice={
-                        "type": "function",
-                        "function": {"name": "send_message"},
-                    },
-                    hindsight_bank_id=uid,
-                )
-                msg2 = resp2.choices[0].message
-                if not msg2.tool_calls:
-                    # 二次生成也选择沉默 → 放弃本条
-                    continue
-                replaced = None
-                for tc2 in msg2.tool_calls:
-                    if tc2.function.name != "send_message":
-                        continue
-                    try:
-                        args2 = json.loads(tc2.function.arguments or "{}")
-                    except json.JSONDecodeError:
-                        continue
-                    cand = args2.get("content") or ""
-                    if cand.strip() and not self.persona.is_repeating(gid, cand):
-                        replaced = cand
-                        break
-                if replaced is None:
-                    # 重生成还是复读 → 直接跳过本条，不发
-                    continue
-                raw_content = replaced
-                # 用一条动态 prompt 写日志的话可以这里 logger.info
-                _ = avoid_hint  # 占位，提示已生成；如需进一步注入可用本变量
-
+            
             # 打字延迟
             delay = self.persona.typing_latency(gid, len(raw_content), now)
             if delay > 0:
                 await asyncio.sleep(delay)
 
-            await self.send_message(event, raw_content, reply_flag)
+            await self._send_to_group(event, raw_content)
 
             # 记录动力学状态
             self.persona.on_self_spoke(gid, uid, raw_content, now)
             self._stats["replied"] += 1
-            content = raw_content
+            last_content = raw_content
 
         self.add_context(
-            bot_content=content,
+            bot_content=last_content,
             message=prefixed,
         )
 
@@ -312,8 +273,6 @@ class AIPlugin(NcatBotPlugin):
                 if not msg.tool_calls:
                     continue
                 for tc in msg.tool_calls:
-                    if tc.function.name != "send_message":
-                        continue
                     try:
                         args = json.loads(tc.function.arguments or "{}")
                     except json.JSONDecodeError:
@@ -336,13 +295,10 @@ class AIPlugin(NcatBotPlugin):
             except Exception as e:
                 self.logger.warning("proactive loop error: %s", e)
 
-    async def send_message(
-        self, event: GroupMessageEvent, content: str, reply: bool
+    async def _send_to_group(
+        self, event: GroupMessageEvent, content: str
     ) -> None:
-        """向当前群聊发送消息，可选择是否回复当前消息。
-
-        当前 ncatbot 没有 reply 引用接口，先退化为普通发。
-        """
+        """向当前群聊发送一条消息。"""
         if not content.strip():
             return
         await self.api.qq.send_group_text(event.group_id, content)
