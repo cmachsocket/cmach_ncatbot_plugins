@@ -165,6 +165,10 @@ class AIPlugin(NcatBotPlugin):
         if not should_reply:
             self._stats["skipped"] += 1
             self.persona.on_self_skipped(gid, uid)
+            LOG.info(
+                "persona 丢弃消息 gid=%s uid=%s text=%r decision=%s",
+                gid, uid, raw_text, decision_info,
+            )
             # 沉默也写一轮对话进历史（用 uid 作占位名，跳过昂贵的
             # get_user_name/resolve_message），让下一轮上下文保持完整。
             self.add_context(bot_content="", message=f"{uid}: {raw_text}")
@@ -202,6 +206,8 @@ class AIPlugin(NcatBotPlugin):
         LOG.info(f"AI content:{resp.choices[0].message.content}")
         if not message.tool_calls:
             # 模型自己选择沉默
+            LOG.info(
+                "模型选择不回复：没有调用 send_message 工具")
             self._stats["skipped"] += 1
             self.persona.on_self_skipped(gid, uid)
             self.add_context(bot_content="", message=prefixed)
@@ -217,6 +223,9 @@ class AIPlugin(NcatBotPlugin):
                 continue
             if arguments.get("reply") is False:  # 严格只匹配 False，不匹配 None
                 # 模型选择不回复
+                LOG.info(
+                    "模型选择不回复：Reply=False"
+                )
                 self._stats["skipped"] += 1
                 self.persona.on_self_skipped(gid, uid)
                 self.add_context(bot_content="", message=prefixed)
