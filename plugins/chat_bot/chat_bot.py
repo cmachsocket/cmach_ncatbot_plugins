@@ -2,9 +2,7 @@ from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 import hindsight_litellm
-from regex import F
 from .time_controller import TemperatureController
-from .persona import SocialDynamics
 import json
 import asyncio
 import concurrent.futures
@@ -114,11 +112,6 @@ class AIPlugin(NcatBotPlugin):
         hindsight_litellm.enable()
         info = await self.api.qq.query.get_login_info()
         self.bot_id = info.user_id
-        # 社交动力学：决定『要不要回』
-        self.persona = SocialDynamics()
-        self.persona.set_bot_id(str(self.bot_id))
-        # 统计：用于评估拟人度
-        self._stats = {"prompt": 0, "replied": 0, "skipped": 0}
         # 主动说话心跳任务（重载时先取消旧的，避免协程堆积）
         if self._bg_task is not None and not self._bg_task.done():
             self._bg_task.cancel()
@@ -126,55 +119,20 @@ class AIPlugin(NcatBotPlugin):
 
     @registrar.qq.on_group_message()
     async def ai_chat(self, event: GroupMessageEvent) -> None:
-        """AI 对话：动力学决定『要不要回』，LLM 决定『说什么』"""
+        """AI 对话：LLM 通过 send_message 工具自行决定『要不要回/说什么』"""
         if not self.is_target_group(event.group_id):
             return
         raw_text = event.message.text.strip()
         if not raw_text:
             return
 
-        gid = str(event.group_id)
         uid = str(event.user_id)
         now = time.monotonic()
-        self._stats["prompt"] += 1
 
         at_list = event.message.filter_at()
         is_at_me = any(str(at.user_id) == self.bot_id for at in at_list)
         has_image = bool(event.message.filter(Image))
 
-        # 1) 把消息喂给动力学
-        self.persona.on_incoming_message(
-            group_id=gid,
-            user_id=uid,
-            text=raw_text,
-            has_image=has_image,
-            is_at_me=is_at_me,
-            now=now,
-        )
-
-        # 2) 求解『该不该回』
-        should_reply, decision_info = self.persona.decide_reply(
-            group_id=gid,
-            user_id=uid,
-            text=raw_text,
-            has_image=has_image,
-            is_at_me=is_at_me,
-            now=now,
-        )
-
-        if not should_reply:
-            self._stats["skipped"] += 1
-            self.persona.on_self_skipped(gid, uid)
-            LOG.info(
-                "persona 丢弃消息 gid=%s uid=%s text=%r decision=%s",
-                gid, uid, raw_text, decision_info,
-            )
-            # 沉默也写一轮对话进历史（用 uid 作占位名，跳过昂贵的
-            # get_user_name/resolve_message），让下一轮上下文保持完整。
-            self.add_context(bot_content="", message=f"{uid}: {raw_text}")
-            return
-
-        # 3) 准备 prompt
         user_name = await self.get_user_name(event.user_id)
         user_message = await self.resolve_message(event.message)
         if not user_message.strip():
@@ -186,11 +144,7 @@ class AIPlugin(NcatBotPlugin):
             temperature = self.temperature_controller.reheat(now)
         context_window = self.temperature_controller.temperature_to_window(temperature)
 
-        decision_ctx = self._build_decision_ctx(decision_info, is_at_me, user_name)
-
-        system_chat = [
-            {"role": "system", "content": SYSTEM_PROMPT + decision_ctx}
-        ]
+        system_chat = [{"role": "system", "content": SYSTEM_PROMPT}]
         user_chat = [{"role": "user", "content": prefixed}]
 
         resp = await self.api.ai.chat(
@@ -206,14 +160,10 @@ class AIPlugin(NcatBotPlugin):
         LOG.info(f"AI content:{resp.choices[0].message.content}")
         if not message.tool_calls:
             # 模型自己选择沉默
-            LOG.info(
-                "模型选择不回复：没有调用 send_message 工具")
-            self._stats["skipped"] += 1
-            self.persona.on_self_skipped(gid, uid)
+            LOG.info("模型选择不回复：没有调用 send_message 工具")
             self.add_context(bot_content="", message=prefixed)
             return
 
-        # 4) 处理工具调用
         last_content = ""
         for tool_call in message.tool_calls:
             try:
@@ -222,30 +172,16 @@ class AIPlugin(NcatBotPlugin):
                 self.logger.warning("send_message 参数不是有效 JSON")
                 continue
             if arguments.get("reply") is False:  # 严格只匹配 False，不匹配 None
-                # 模型选择不回复
-                LOG.info(
-                    "模型选择不回复：Reply=False"
-                )
-                self._stats["skipped"] += 1
-                self.persona.on_self_skipped(gid, uid)
+                LOG.info("模型选择不回复：Reply=False")
                 self.add_context(bot_content="", message=prefixed)
                 return
-                
+
             raw_content = arguments.get("content") or ""
-            
+
             if not raw_content.strip():
                 continue
-            
-            # 打字延迟
-            delay = self.persona.typing_latency(gid, len(raw_content), now)
-            if delay > 0:
-                await asyncio.sleep(delay)
 
             await self._send_to_group(event, raw_content)
-
-            # 记录动力学状态
-            self.persona.on_self_spoke(gid, uid, raw_content, now)
-            self._stats["replied"] += 1
             last_content = raw_content
 
         self.add_context(
@@ -261,8 +197,8 @@ class AIPlugin(NcatBotPlugin):
             try:
                 gid = str(self.target_group_id)
                 now = time.monotonic()
-                impulse = self.persona.proactive_impulse(gid, now)
-                if random.random() > impulse:
+                # 简单按概率决定是否主动开话题
+                if random.random() > 0.5:
                     continue
                 if not self.assistent_messages:
                     continue
@@ -289,12 +225,7 @@ class AIPlugin(NcatBotPlugin):
                     content = args.get("content") or ""
                     if not content.strip():
                         continue
-                    if self.persona.is_repeating(gid, content):
-                        continue
-                    delay = self.persona.typing_latency(gid, len(content), now)
-                    await asyncio.sleep(delay)
                     await self.api.qq.send_group_text(self.target_group_id, content)
-                    self.persona.on_self_spoke(gid, "self", content, now)
                     self.add_context(
                         bot_content=content,
                         message=content,
@@ -315,66 +246,6 @@ class AIPlugin(NcatBotPlugin):
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
 
-    def _build_decision_ctx(
-        self,
-        decision_info: dict[str, Any],
-        is_at_me: bool,
-        user_name: str,
-    ) -> str:
-        """把动力学的数值状态翻译成自然语言描述，给 LLM 看。
-
-        设计原则：LLM 不应该看到浮点数——只看到『定性』的状态描述，
-        这样不会让它过度模仿数值（比如看到 mood=+0.3 就硬塞颜文字）。
-        数值仍由 persona 内部决策使用。
-        """
-        energy = float(decision_info.get("energy", 0.5))
-        mood = float(decision_info.get("mood", 0.0))
-        affection = float(decision_info.get("affection", 0.4))
-        fatigue = float(decision_info.get("fatigue", 0.0))
-
-        # 能量 → 疲倦度
-        if energy > 0.7:
-            energy_desc = "你现在精神很好"
-        elif energy > 0.4:
-            energy_desc = "你有点累"
-        else:
-            energy_desc = "你现在很疲倦"
-
-        # 情绪 → 心情
-        if mood > 0.3:
-            mood_desc = "心情不错"
-        elif mood > 0.1:
-            mood_desc = "有点小开心"
-        elif mood < -0.3:
-            mood_desc = "心情不太好"
-        elif mood < -0.1:
-            mood_desc = "有点低落"
-        else:
-            mood_desc = "心情一般"
-
-        # 亲密度 → 关系
-        if affection > 0.7:
-            rel_desc = f"你跟 {user_name} 很有好感"
-        elif affection > 0.4:
-            rel_desc = f"你跟 {user_name} 关系不错"
-        else:
-            rel_desc = f"你跟 {user_name} 试图保持友好"
-
-        # 疲劳 → 语气长度提示
-        if fatigue > 0.6:
-            fatigue_desc = "刚才聊得有点多，简短点回就行"
-        else:
-            fatigue_desc = ""
-
-        # 必须回 vs 可不回
-        must_desc = "这条必须回" if is_at_me else "这条可回可不回"
-
-        parts = [energy_desc + "，", mood_desc + "。", rel_desc + "。"]
-        if fatigue_desc:
-            parts.append(fatigue_desc + "。")
-        parts.append(f"{must_desc}。")
-
-        return "\n[内心状态] " + " ".join(parts) + "\n"
     def add_context(self, bot_content: str, message: str) -> None:
         """记录一轮对话到上下文历史。
 
