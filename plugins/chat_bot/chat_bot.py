@@ -56,7 +56,8 @@ SYSTEM_PROMPT = SOUL_PROMPT + \
 
 GUIDELINES:
 你在一个群聊里面，你收到的消息不一定是发给你的，你需要根据上下文和语境来判断是否回复。
-发送消息时，**必须**调用 send_message 工具；任何直接输出的文字都会被**完全丢弃**，不会作为消息内容发送!!!
+对于一条消息，<quote>...</quote> 里面的内容是引用的消息，通常是你之前发过的消息或者其他人的消息，你需要根据这些引用来判断当前消息的语境。user_name : message 是用户发给你的消息, 不同的user_name代表不同的用户,你需要根据这些消息来判断每个用户的意图和情感。
+重要！！！发送消息时，**必须**调用 send_message 工具；任何直接输出的文字都会被**完全丢弃**，不会作为消息内容发送!!!
 你可以自行决定是否调用 send_message 工具，或者直接忽略用户消息。不需要每一条都回复，像人一样选择性回复就行。
 """
 
@@ -132,11 +133,16 @@ class AIPlugin(NcatBotPlugin):
 
     @registrar.qq.on_group_message()
     async def ai_chat(self, event: GroupMessageEvent) -> None:
-        """AI 对话：LLM 通过 send_message 工具自行决定『要不要回/说什么』"""
+        """AI 对话：LLM 通过 send_message 工具自行决定『要不要回/说什么』。
+
+        本轮消息如果是多模态（带图片），把图片作为 image_url part 一起发给 LLM。
+        但写入历史 (assistent_messages) 的只有纯文本版本，图片用 [图片] 占位，
+        避免历史越攒越大、过期 URL 被反复引用。
+        """
         if not self.is_target_group(event.group_id):
             return
         raw_text = event.message.text.strip()
-        if not raw_text:
+        if not raw_text or not event.message.filter_image():
             return
 
         uid = str(event.user_id)
@@ -149,18 +155,31 @@ class AIPlugin(NcatBotPlugin):
         has_image = bool(event.message.filter(Image))
 
         user_name = await self.get_user_name(event.user_id)
-        user_message = await self.resolve_message(event.message)
-        if not user_message.strip():
+        # 同时拿到：① 纯文本（用于历史）② 多模态 parts（用于本轮 LLM 调用）
+        user_text, mm_parts = await self.resolve_message_multimodal(event.message)
+        if not user_text.strip():
             return
-        prefixed = f"{user_name}: {user_message}"
+        prefixed_text = f"{user_name}: {user_text}"
+
+        # 本轮要发给 LLM 的 user content：有图片用多模态列表，纯文本用 str
+        if mm_parts:
+            # 把前置名字加到第一个 text part；后续 At/图片已经填好
+            mm_parts.insert(
+                0, {"type": "text", "text": f"{user_name}: "}
+            )
+            user_chat_content: Any = mm_parts
+        else:
+            user_chat_content = prefixed_text
 
         temperature = self.temperature_controller.current_temperature(now)
-        if self.temperature_controller.should_reheat(prefixed, temperature, now):
+        if self.temperature_controller.should_reheat(
+            prefixed_text, temperature, now
+        ):
             temperature = self.temperature_controller.reheat(now)
         context_window = self.temperature_controller.temperature_to_window(temperature)
 
         system_chat = [{"role": "system", "content": SYSTEM_PROMPT}]
-        user_chat = [{"role": "user", "content": prefixed}]
+        user_chat = [{"role": "user", "content": user_chat_content}]
 
         resp = await self.api.ai.chat(
             system_chat + self.assistent_messages[-context_window:] + user_chat,
@@ -176,7 +195,7 @@ class AIPlugin(NcatBotPlugin):
         if not message.tool_calls:
             # 模型自己选择沉默
             LOG.info("模型选择不回复：没有调用 send_message 工具")
-            self.add_context(bot_content="", message=prefixed)
+            self.add_context(bot_content="", message=prefixed_text)
             return
 
         last_content = ""
@@ -188,7 +207,7 @@ class AIPlugin(NcatBotPlugin):
                 continue
             if arguments.get("reply") is False:  # 严格只匹配 False，不匹配 None
                 LOG.info("模型选择不回复：Reply=False")
-                self.add_context(bot_content="", message=prefixed)
+                self.add_context(bot_content="", message=prefixed_text)
                 return
 
             raw_content = arguments.get("content") or ""
@@ -201,7 +220,7 @@ class AIPlugin(NcatBotPlugin):
 
         self.add_context(
             bot_content=last_content,
-            message=prefixed,
+            message=prefixed_text,
         )
 
     async def _proactive_loop(self) -> None:
@@ -235,7 +254,7 @@ class AIPlugin(NcatBotPlugin):
                 # 让模型自创一句
                 prompt_msgs = [
                     {"role": "system", "content": SYSTEM_PROMPT
-                        + "\n[模式] 主动发起话题。随便说点啥——想起的事、对群友的吐槽、自嘲。"}
+                        + "\n[模式] 主动发起话题。不一定与记忆相关，也不一定与当前群聊的最新消息相关。可以是一个问题、一个建议、一个有趣的想法、一个冷知识、一个笑话等。"}
                 ] + self.assistent_messages[-8:]
                 resp = await self.api.ai.chat(
                     prompt_msgs,
@@ -311,7 +330,11 @@ class AIPlugin(NcatBotPlugin):
         nickname: str = getattr(member_info, "nickname", "") or ""
         return card or nickname or "未知用户"
     async def resolve_message(self, messages: MessageArray) -> str:
-        """解析消息内容"""
+        """把 MessageArray 解析成纯文本，用于历史/日志。
+
+        图片在历史里只保留 [图片] 占位，不存 url/数据。
+        Reply 引用块、@ 这些行为保持原样。
+        """
         message = ""
         reply_msg = "<quote>\n"
         reply_ids = messages.filter(Reply)
@@ -334,5 +357,83 @@ class AIPlugin(NcatBotPlugin):
             elif isinstance(msg, At):
                 name = await self.get_user_name(msg.user_id)
                 message += f"@{name} "
+            elif isinstance(msg, Image):
+                # 历史里不要存图片 url/数据，只留一句占位
+                message += "[图片] "
         LOG.info(f"resolve_message: {message}")
         return message
+
+    async def resolve_message_multimodal(
+        self, messages: MessageArray
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        """把 MessageArray 拆成 (纯文本, 多模态 parts)。
+
+        多模态 parts 用 OpenAI content 格式：[{type: text}, {type: image_url}, ...]
+        当消息里没有任何图片时，第二项是空列表；调用方在两种情况下都需要
+        把"纯文本"作为历史里写入的内容。
+
+        实现参考 ncatbot 内部的 _convert_message_array，但保持独立，不依赖私有 API。
+        """
+        text_buf: list[str] = []
+
+        # 处理 Reply：作为纯文本 quote 块塞到消息开头
+        reply_ids = messages.filter(Reply)
+        if reply_ids:
+            quote_lines = ["<quote>"]
+            for reply in reply_ids:
+                message_data = await self.api.qq.query.get_msg(reply.id)
+                if message_data is None:
+                    continue
+                if (
+                    message_data.sender is not None
+                    and message_data.sender.user_id is not None
+                ):
+                    name = await self.get_user_name(message_data.sender.user_id)
+                else:
+                    name = "未知用户"
+                quoted = MessageArray.from_list(
+                    message_data.message or []
+                ).text
+                quote_lines.append(f"{name}：{quoted}")
+            quote_lines.append("</quote>")
+            text_buf.append("\n".join(quote_lines) + "\n")
+
+        multimodal_parts: List[Dict[str, Any]] = []
+        for seg in messages:
+            if isinstance(seg, PlainText):
+                text_buf.append(seg.text)
+                # 文本段也加入多模态 parts，保证最终排版与纯文本版本一致
+                # （如果消息里没有任何图片，下方会整体走 str 分支，不会用到这些 parts）
+                multimodal_parts.append({"type": "text", "text": seg.text})
+            elif isinstance(seg, At):
+                name = await self.get_user_name(seg.user_id)
+                # 历史里用真实昵称；多模态里也用昵称（与历史保持一致）
+                mention = f"@{name} "
+                text_buf.append(mention)
+                multimodal_parts.append({"type": "text", "text": mention})
+            elif isinstance(seg, Image):
+                url = seg.url or seg.file or ""
+                if not url:
+                    continue
+                # base64:// 前缀按 ncatbot 约定转 data URI
+                if url.startswith("base64://"):
+                    url = f"data:image/png;base64,{url[9:]}"
+                # 历史里只放占位
+                text_buf.append("[图片] ")
+                multimodal_parts.append(
+                    {"type": "image_url", "image_url": {"url": url}}
+                )
+            elif isinstance(seg, Reply):
+                # 已在外层 quote 块里处理过，这里跳过避免重复
+                continue
+            else:
+                LOG.info("resolve_message_multimodal: 跳过段 %s", type(seg).__name__)
+
+        text_only = "".join(text_buf)
+        # 若没有任何 image_url 段，多模态 parts 没意义，调用方会走纯文本分支
+        has_image_part = any(
+            p.get("type") == "image_url" for p in multimodal_parts
+        )
+        if not has_image_part:
+            multimodal_parts = []
+        return text_only, multimodal_parts
