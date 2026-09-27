@@ -99,9 +99,22 @@ class AIPlugin(NcatBotPlugin):
     max_k: int = 60  # 历史消息缓存上限
     dynamic_k: int = 40  # 温度动态调节的基准上下文窗口
     _bg_task: Optional[asyncio.Task[None]] = None
+    # 上次收到真实用户消息的 monotonic 时间，用于主动说话沉默计时
+    _last_user_msg_at: float = 0.0
+
+    # ---- 主动说话参数 ----
+    # 群沉默超过这个秒数才开始计算主动说话概率
+    PROACTIVE_SILENCE_THRESHOLD_S: float = 3.0 * 3600.0
+    # 沉默刚跨过阈值时的初始概率
+    PROACTIVE_P_START: float = 0.01
+    # 每多沉默一小时，概率增加多少（线性）
+    PROACTIVE_P_SLOPE_PER_HOUR: float = 0.05
+    # 心跳间隔（小时）
+    PROACTIVE_TICK_HOURS: float = 1.0
 
     async def on_load(self) -> None:
         self.assistent_messages = []
+        self._last_user_msg_at = time.monotonic()
         self.temperature_controller = TemperatureController(window_max=self.dynamic_k)
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
@@ -128,6 +141,8 @@ class AIPlugin(NcatBotPlugin):
 
         uid = str(event.user_id)
         now = time.monotonic()
+        # 记录真实用户消息时间，供主动说话心跳判断『沉默多久』
+        self._last_user_msg_at = now
 
         at_list = event.message.filter_at()
         is_at_me = any(str(at.user_id) == self.bot_id for at in at_list)
@@ -190,15 +205,30 @@ class AIPlugin(NcatBotPlugin):
         )
 
     async def _proactive_loop(self) -> None:
-        """主动说话心跳：不依赖用户消息"""
+        """主动说话心跳：不依赖用户消息。
+
+        策略：
+          - 群沉默 < 3h：不主动说
+          - 沉默 >= 3h 后，每小时判定一次
+          - 概率 p(silence_h) = 0.01 + 0.05 * silence_h（线性），上限 1.0
+          - 平均第一次主动说话 ~ 沉默跨过阈值后约 5h（总 ~8h）
+        """
+        tick_s = self.PROACTIVE_TICK_HOURS * 3600.0
         while True:
-            # 20~90 分钟一醒
-            await asyncio.sleep(random.uniform(1200, 5400))
+            await asyncio.sleep(tick_s)
             try:
-                gid = str(self.target_group_id)
                 now = time.monotonic()
-                # 简单按概率决定是否主动开话题
-                if random.random() > 0.5:
+                silence_s = now - self._last_user_msg_at
+                silence_h = (silence_s - self.PROACTIVE_SILENCE_THRESHOLD_S) / 3600.0
+                if silence_h <= 0:
+                    # 还没沉默够 3 小时，不主动开话题
+                    continue
+                p = min(
+                    1.0,
+                    self.PROACTIVE_P_START
+                    + self.PROACTIVE_P_SLOPE_PER_HOUR * silence_h,
+                )
+                if random.random() >= p:
                     continue
                 if not self.assistent_messages:
                     continue
@@ -226,6 +256,7 @@ class AIPlugin(NcatBotPlugin):
                     if not content.strip():
                         continue
                     await self.api.qq.send_group_text(self.target_group_id, content)
+                    # 主动说话也算 bot 自己说过话，不算用户消息
                     self.add_context(
                         bot_content=content,
                         message=content,
