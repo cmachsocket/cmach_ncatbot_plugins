@@ -143,7 +143,7 @@ class AIPlugin(NcatBotPlugin):
         if not self.is_target_group(event.group_id):
             return
         raw_text = event.message.text.strip()
-        if not raw_text or not event.message.filter_image():
+        if not raw_text and not event.message.filter_image():
             return
 
         uid = str(event.user_id)
