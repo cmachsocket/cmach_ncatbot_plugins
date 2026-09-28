@@ -280,6 +280,7 @@ class AIPlugin(NcatBotPlugin):
         #     message=prefixed_text,
         # ) 以后修改逻辑，send_message 工具里不再 add_context，避免重复 add
         # 每个群成员一个记忆库，和旧的 hindsight_bank_id=uid 行为一致
+        LOG.info(f"ai_chat: {event.message_id}")
         await self._run_agent(
             [system_chat, is_at_chat, self.get_now_time(), *history, user_chat],
             bank_id=uid,
@@ -380,6 +381,7 @@ class AIPlugin(NcatBotPlugin):
             "event": event,
             "user_msg": user_msg,
         }
+        LOG.info("agent run: bank_id=%s", bank_id)
         async with self._bank_lock:
             self._set_hindsight_bank(bank_id)
             return await self.agent.ainvoke(state)
