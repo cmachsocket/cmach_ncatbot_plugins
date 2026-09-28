@@ -180,7 +180,7 @@ class AIPlugin(NcatBotPlugin):
         self.assistent_messages = []
         self._last_user_msg_at = time.monotonic()
         self.temperature_controller = TemperatureController(
-            token_base=self.get_config("CONTEXT_TOKEN_BUDGET", 4096),
+            token_base=self.get_config("CONTEXT_TOKEN_BUDGET", 65536),
         )
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
