@@ -35,6 +35,8 @@ from langchain_core.messages import (
     trim_messages,
 )
 from langchain_core.tools import tool
+import litellm
+from langchain_core.messages import convert_to_openai_messages
 
 LOG = get_log("AIPlugin")
 
@@ -242,10 +244,18 @@ class AIPlugin(NcatBotPlugin):
         return SystemMessage(content=f"[当前时间] {now_str}")
 
     def _count_tokens(self, messages: Iterable[Any]) -> int:
-        """委托 ChatLiteLLM 使用其 LangChain token 计数实现。"""
+        """用 litellm 内置的 token_counter 精确计数（按 self.model 自动选分词器）。"""
         if self.chat_llm is None:
             raise RuntimeError("chat_llm 未初始化，请检查 ai 适配器配置")
-        return self.chat_llm.get_num_tokens_from_messages(list(messages))
+
+        msgs = list(messages)
+        # BaseMessage -> OpenAI 格式 dict（litellm 只认 dict 格式）
+        openai_msgs = convert_to_openai_messages(msgs)
+
+        try:
+            return litellm.token_counter(model=self.model, messages=openai_msgs)
+        except Exception as e:
+            raise RuntimeError(f"计算 token 数量时出错: {e}")
 
     @registrar.qq.on_group_message()
     async def ai_chat(self, event: GroupMessageEvent) -> None:
