@@ -4,9 +4,16 @@ import math
 import time
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, TypeVar, Union
 
 import litellm
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    message_to_dict,
+)
 
 # 上下文窗口按 token 计，不再按消息条数
 DEFAULT_TOKEN_MAX = 4096
@@ -17,23 +24,85 @@ DEFAULT_TOKEN_MIN = 256
 # 直接写成字面量而不是 **dict 展开：展开的话 pyright 无法确定参数类型。
 IMAGE_TOKEN_COUNT_OPT = True
 
+# 历史里用的是 LangChain 消息对象，统计 token 时要转回 OpenAI dict 格式
+MessageLike = Union[AIMessage, HumanMessage, SystemMessage, Dict[str, Any]]
+
+# 让 select_context_by_tokens 原样保留传入的消息类型
+_M = TypeVar("_M", bound=MessageLike)
+
 # 逐条消息的 token 计数缓存。assistent_messages 里的消息是追加且不可变的，
 # 所以同一批消息在多轮里会被反复统计，缓存能省掉大量重复分词。
 _TOKEN_CACHE: Dict[tuple, int] = {}
 _TOKEN_CACHE_MAX = 2048
 
 
-def _cache_key(message: Dict[str, Any]) -> tuple:
-    content = message.get("content", "")
+def _to_openai_dict(message: Union[BaseMessage, Dict[str, Any]]) -> Dict[str, Any]:
+    """把 BaseMessage / dict 统一转成 OpenAI messages 元素。
+
+    langchain 的 type（system/human/ai）和 OpenAI 的 role（system/user/assistant）
+    命名不一样，litellm 只认后者。
+    """
+    if isinstance(message, BaseMessage):
+        converted = message_to_dict(message)
+        # message_to_dict 返回 {"type": ..., "data": {...}}，
+        # 拆出 data 里的 role/content 再把 type 映射成 role
+        data = converted.get("data") or {}
+        role = data.get("role")
+        if role is None:
+            # langchain type -> openai role
+            role = {
+                "system": "system",
+                "human": "user",
+                "ai": "assistant",
+            }.get(converted.get("type", ""), "user")
+        return {"role": role, "content": data.get("content", "")}
+    return message
+
+
+def _cache_key(message: Union[BaseMessage, Dict[str, Any]]) -> tuple:
+    normalized = _to_openai_dict(message)
+    content = normalized.get("content", "")
     if not isinstance(content, str):
         # 多模态 content（list[dict]）用 repr 兜底
         content = repr(content)
-    return (message.get("role", ""), content)
+    return (normalized.get("role", ""), content)
 
 
-def count_message_tokens(message: Dict[str, Any]) -> int:
+def count_tools_tokens(tools: Sequence[Any], tool_name: str) -> int:
+    """统计工具定义 + tool_choice 占用的 token 数。
+
+    工具 schema 每轮都要发，和 system prompt 一样是固定开销，
+    所以要计入上下文预算。tools 传 langchain 的 BaseTool 列表。
+    """
+    from litellm.types.utils import ChatCompletionToolParam
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    try:
+        # convert_to_openai_tool 声明返回 dict[str, Any]，这里显式重建成
+        # TypedDict，让 pyright 能校验结构
+        converted: List[ChatCompletionToolParam] = [
+            ChatCompletionToolParam(**convert_to_openai_tool(t)) for t in tools
+        ]
+        return int(
+            litellm.token_counter(
+                messages=[{"role": "system", "content": ""}],
+                tools=converted,
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": tool_name},
+                },
+                use_default_image_token_count=IMAGE_TOKEN_COUNT_OPT,
+            )
+        )
+    except Exception:
+        # 统计失败不应该影响正常对话
+        return 0
+
+
+def count_message_tokens(message: Union[BaseMessage, Dict[str, Any]]) -> int:
     """统计单条消息的 token 数（含 role/格式开销）。
 
+    message 可以是任意 LangChain BaseMessage 子类，也可以是 OpenAI dict。
     带缓存；multimodal content（图片）会按默认视觉开销计入。
     """
     key = _cache_key(message)
@@ -42,7 +111,7 @@ def count_message_tokens(message: Dict[str, Any]) -> int:
         return cached
     tokens = int(
         litellm.token_counter(
-            messages=[message],
+            messages=[_to_openai_dict(message)],
             use_default_image_token_count=IMAGE_TOKEN_COUNT_OPT,
         )
     )
@@ -53,15 +122,20 @@ def count_message_tokens(message: Dict[str, Any]) -> int:
 
 
 def count_tokens(content: Any) -> int:
-    """统计任意内容（str / dict 消息 / list[dict] 消息列表）的 token 数。"""
+    """统计任意内容（str / 消息 / 消息列表）的 token 数。
+
+    通用入口，接受任何 BaseMessage 子类；count_message_tokens 才是窄类型。
+    """
     if content is None:
         return 0
     if isinstance(content, str):
         return int(litellm.token_counter(text=content))
-    if isinstance(content, dict):
+    if isinstance(content, (BaseMessage, dict)):
         return count_message_tokens(content)
     if isinstance(content, Sequence):
-        return sum(count_message_tokens(m) for m in content if isinstance(m, dict))
+        return sum(
+            count_message_tokens(m) for m in content if isinstance(m, (BaseMessage, dict))
+        )
     return int(litellm.token_counter(text=str(content)))
 
 
@@ -164,15 +238,15 @@ class TemperatureController:
 
     def select_context_by_tokens(
         self,
-        messages: Sequence[Dict[str, Any]],
+        messages: Sequence[_M],
         budget: int,
         reserve: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[_M]:
         """从 messages 尾部往前取，取到 token 预算用满为止。
 
         参数
         ----
-        messages: 历史消息列表（OpenAI messages 格式），按时间正序。
+        messages: 历史消息列表（LangChain BaseMessage 或 OpenAI dict），按时间正序。
         budget:   分配给历史消息的 token 预算。
         reserve:  为 system prompt / tools / 当前用户消息预留的 token。
                   这些不计入本函数，但会从可用空间里扣掉。
@@ -187,7 +261,7 @@ class TemperatureController:
         if remaining <= 0:
             return []
 
-        selected: List[Dict[str, Any]] = []
+        selected: List[_M] = []
         used = 0
         for message in reversed(messages):
             cost = count_message_tokens(message)
@@ -200,9 +274,19 @@ class TemperatureController:
         selected.reverse()
         return selected
 
-    def count_total_tokens(self, messages: Sequence[Dict[str, Any]]) -> int:
+    def count_total_tokens(self, messages: Sequence[MessageLike]) -> int:
         """统计一整组消息的 token 总数。"""
-        return sum(count_message_tokens(m) for m in messages if isinstance(m, dict))
+        return sum(
+            count_message_tokens(m)
+            for m in messages
+            if isinstance(m, (BaseMessage, dict))
+        )
+        """统计一整组消息的 token 总数。"""
+        return sum(
+            count_message_tokens(m)
+            for m in messages
+            if isinstance(m, (BaseMessage, dict))
+        )
 
     def reheat(self, now: float | None = None) -> float:
         if now is None:

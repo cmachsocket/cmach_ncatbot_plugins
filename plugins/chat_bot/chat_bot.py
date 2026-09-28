@@ -2,20 +2,54 @@ from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 import hindsight_litellm
-from .time_controller import TemperatureController
+from .time_controller import TemperatureController, count_tools_tokens
 import json
 import asyncio
 import concurrent.futures
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Annotated, Any, Dict, List, Optional, Sequence, Union
 from ncatbot.utils import get_log
 
 from ncatbot.types import MessageArray,Reply,PlainText,At,Image
 
+from langchain.agents import create_agent
+from langchain.agents.middleware.types import InputAgentState
+from langchain_litellm import ChatLiteLLM
+from ncatbot.utils import get_config_manager
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+)
+from langchain_core.tools import tool, InjectedToolArg
+
 LOG = get_log("AIPlugin")
 
+@tool("send_message")
+async def send_message_tool(
+    content: str,
+    reply: bool = False,
+    # 下面三个参数 LLM 看不到，从 config 注入
+    plugin: Annotated[Any, InjectedToolArg] = None,
+    event: Annotated[Any, InjectedToolArg] = None,
+    user_msg: Annotated[str, InjectedToolArg] = "",
+) -> str:
+    """向当前群聊发送一条消息。reply=true 表示回复当前用户；false 表示选择不回复。"""
+    if not reply or not content.strip():
+        LOG.info("模型选择不回复")
+        plugin.add_context(bot_content="", message=user_msg)
+        return "skipped"
+
+    if event is not None:
+        await plugin._send_to_group(event, content)
+    else:
+        # 主动说话场景没有 event
+        await plugin.api.qq.send_group_text(plugin.target_group_id, content)
+
+    plugin.add_context(bot_content=content, message=user_msg)
+    return "sent"
 def _patch_hindsight_run_async() -> None:
     """Monkey patch hindsight_client._run_async to be safe inside a running event loop.
 
@@ -62,31 +96,6 @@ GUIDELINES:
 不要输出markdown、代码块、表格、列表等格式化内容，直接输出纯文本即可。
 """
 
-TOOLS_SCHEMA: List[Dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "send_message",
-            "description": "向当前群聊发送一条消息",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "要发送给用户的消息内容",
-                    },
-                    "reply": {
-                        "type": "boolean",
-                        "description": "是否回复当前用户的消息；true 为回复，false 为不回复",
-                        "default": False,
-                    },
-                },
-                "required": ["content", "reply"],
-            },
-        },
-    },
-]
-
 
 
 
@@ -97,13 +106,17 @@ class AIPlugin(NcatBotPlugin):
     hindsight_port: int = 7071
     target_group_id: int = 1093424135
     bot_id: Optional[str] = None
-    assistent_messages: List[Dict[str, str]] = []  # 用于存储上下文
+    # 历史里只有 HumanMessage / AIMessage 两种，不含 ToolMessage 等
+    assistent_messages: List[Union[HumanMessage, AIMessage]] = []
     max_k: int = 60  # 历史消息条数缓存上限（内存层面，token 由 context_budget 限制）
     context_budget: int = 4096  # 上下文 token 预算上限
     _bg_task: Optional[asyncio.Task[None]] = None
     # 上次收到真实用户消息的 monotonic 时间，用于主动说话沉默计时
     _last_user_msg_at: float = 0.0
-
+    model : str
+    api_key : str
+    base_url : str 
+    chat_llm : Optional[ChatLiteLLM] = None
     # ---- 主动说话参数 ----
     # 群沉默超过这个秒数才开始计算主动说话概率
     PROACTIVE_SILENCE_THRESHOLD_S: float = 3.0 * 3600.0
@@ -133,7 +146,23 @@ class AIPlugin(NcatBotPlugin):
         if self._bg_task is not None and not self._bg_task.done():
             self._bg_task.cancel()
         self._bg_task = asyncio.create_task(self._proactive_loop())
-
+        manager = get_config_manager()
+        ai_entry = manager.get_adapter_config("ai")
+        if ai_entry :
+            self.model = ai_entry.config.get("completion_model", "")
+            self.api_key = ai_entry.config.get("api_key", "")
+            self.base_url = ai_entry.config.get("base_url", "")
+            self.chat_llm = ChatLiteLLM(
+                model=self.model,
+                api_key=self.api_key,
+                api_base=self.base_url,
+            )
+        if self.chat_llm:
+            self.agent = create_agent(
+                self.chat_llm,
+                tools=[send_message_tool],
+            )
+    
     @registrar.qq.on_group_message()
     async def ai_chat(self, event: GroupMessageEvent) -> None:
         """AI 对话：LLM 通过 send_message 工具自行决定『要不要回/说什么』。
@@ -165,12 +194,14 @@ class AIPlugin(NcatBotPlugin):
         prefixed_text = f"{user_name}: {user_text}"
 
         # 本轮要发给 LLM 的 user content：有图片用多模态列表，纯文本用 str
+        # HumanMessage.content 声明的是 list[str | dict]，Sequence 协变后兼容
         if mm_parts:
             # 把前置名字加到第一个 text part；后续 At/图片已经填好
-            mm_parts.insert(
-                0, {"type": "text", "text": f"{user_name}: "}
-            )
-            user_chat_content: Any = mm_parts
+            mm_parts = [
+                {"type": "text", "text": f"{user_name}: "},
+                *mm_parts,
+            ]
+            user_chat_content: str | Sequence[Dict[str, Any]] = mm_parts
         else:
             user_chat_content = prefixed_text
 
@@ -184,60 +215,36 @@ class AIPlugin(NcatBotPlugin):
             temperature
         )
 
-        system_chat = [{"role": "system", "content": SYSTEM_PROMPT}]
-        user_chat = [{"role": "user", "content": user_chat_content}]
+        system_chat = SystemMessage(content=SYSTEM_PROMPT)
+        user_chat = HumanMessage(content=user_chat_content)
 
         # system prompt + 工具定义 + 本轮用户消息是固定开销，先扣掉，
         # 剩下的预算才分给历史，否则总长度会顶穿 token 上限
         fixed_tokens = (
-            self.temperature_controller.count_total_tokens(system_chat + user_chat)
+            self.temperature_controller.count_total_tokens([system_chat, user_chat])
             + self._count_tools_tokens()
         )
         history = self.temperature_controller.select_context_by_tokens(
             self.assistent_messages, token_budget, reserve=fixed_tokens
         )
-
-        resp = await self.api.ai.chat(
-            system_chat + history + user_chat,
-            tools=TOOLS_SCHEMA,
-            tool_choice={
-                "type": "function",
-                "function": {"name": "send_message"},
-            },
-            hindsight_bank_id=uid,
-        )
-        message = resp.choices[0].message
-        LOG.info(f"AI content:{resp.choices[0].message.content}")
-        if not message.tool_calls:
-            # 模型自己选择沉默
-            LOG.info("模型选择不回复：没有调用 send_message 工具")
-            self.add_context(bot_content="", message=prefixed_text)
-            return
-
-        last_content = ""
-        for tool_call in message.tool_calls:
-            try:
-                arguments = json.loads(tool_call.function.arguments or "{}")
-            except json.JSONDecodeError:
-                self.logger.warning("send_message 参数不是有效 JSON")
-                continue
-            if arguments.get("reply") is False:  # 严格只匹配 False，不匹配 None
-                LOG.info("模型选择不回复：Reply=False")
-                self.add_context(bot_content="", message=prefixed_text)
-                return
-
-            raw_content = arguments.get("content") or ""
-
-            if not raw_content.strip():
-                continue
-
-            await self._send_to_group(event, raw_content)
-            last_content = raw_content
-
-        self.add_context(
-            bot_content=last_content,
-            message=prefixed_text,
-        )
+        # self.add_context(
+        #     bot_content="",  
+        #     message=prefixed_text,
+        # ) 以后修改逻辑，send_message 工具里不再 add_context，避免重复 add
+        state: InputAgentState = {
+            "messages": [system_chat, *history, user_chat]
+        }
+        result = await self.agent.ainvoke(
+                    state,
+                    config={
+                        "configurable": {
+                            "plugin": self,
+                            "event": event,
+                            "user_msg": prefixed_text,   # 当前这轮用户消息，供 add_context 用
+                        }
+                    },
+)
+        
 
     async def _proactive_loop(self) -> None:
         """主动说话心跳：不依赖用户消息。
@@ -269,11 +276,10 @@ class AIPlugin(NcatBotPlugin):
                     continue
                 # 让模型自创一句。主动说话只需要一点近期上下文，
                 # 用固定 token 预算而不是固定条数
-                proactive_system = {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT
-                    + "\n[模式] 主动发起话题。不一定与记忆相关，也不一定与当前群聊的最新消息相关。可以是一个问题、一个建议、一个有趣的想法、一个冷知识、一个笑话等。",
-                }
+                proactive_system = SystemMessage(
+                    content=SYSTEM_PROMPT
+                    + "\n[模式] 主动发起话题。不一定与记忆相关，也不一定与当前群聊的最新消息相关。可以是一个问题、一个建议、一个有趣的想法、一个冷知识、一个笑话等。"
+                )
                 reserve = self.temperature_controller.count_total_tokens(
                     [proactive_system]
                 ) + self._count_tools_tokens()
@@ -282,31 +288,19 @@ class AIPlugin(NcatBotPlugin):
                     self.context_budget,
                     reserve=reserve,
                 )
-                prompt_msgs = [proactive_system] + history
-                resp = await self.api.ai.chat(
-                    prompt_msgs,
-                    tools=TOOLS_SCHEMA,
-                    tool_choice={"type": "function", "function": {"name": "send_message"}},
-                    hindsight_bank_id="self",
-                )
-                msg = resp.choices[0].message
-                LOG.info(f"AI content:{resp.choices[0].message.content}")
-                if not msg.tool_calls:
-                    continue
-                for tc in msg.tool_calls:
-                    try:
-                        args = json.loads(tc.function.arguments or "{}")
-                    except json.JSONDecodeError:
-                        continue
-                    content = args.get("content") or ""
-                    if not content.strip():
-                        continue
-                    await self.api.qq.send_group_text(self.target_group_id, content)
-                    # 主动说话也算 bot 自己说过话，不算用户消息
-                    self.add_context(
-                        bot_content=content,
-                        message=content,
-                    )
+                state: InputAgentState = {
+                    "messages": [proactive_system, *history]
+                }
+                result = await self.agent.ainvoke(
+                            state,
+                            config={
+                                "configurable": {
+                                    "plugin": self,
+                                    # event 不传，工具里走 target_group_id 分支
+                                    "user_msg": "",   # 主动说话没有用户消息
+                                }
+                            },
+                        )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -316,29 +310,9 @@ class AIPlugin(NcatBotPlugin):
         """工具定义 + tool_choice 占用的 token 数。
 
         工具 schema 每轮都要发，和 system prompt 一样是固定开销。
+        实际统计逻辑在 time_controller.count_tools_tokens。
         """
-        from litellm import token_counter
-
-        try:
-            return int(
-                token_counter(
-                    messages=[{"role": "system", "content": ""}],
-                    # TOOLS_SCHEMA 是普通 dict 字面量，litellm 声明的是
-                    # ChatCompletionToolParam；结构上等价，这里 cast 一下过类型检查
-                    tools=cast(Any, TOOLS_SCHEMA),
-                    tool_choice=cast(
-                        Any,
-                        {
-                            "type": "function",
-                            "function": {"name": "send_message"},
-                        },
-                    ),
-                    use_default_image_token_count=True,
-                )
-            )
-        except Exception as e:
-            self.logger.warning("统计工具定义 token 失败: %s", e)
-            return 0
+        return count_tools_tokens([send_message_tool], send_message_tool.name)
 
     async def _send_to_group(
         self, event: GroupMessageEvent, content: str
@@ -358,10 +332,13 @@ class AIPlugin(NcatBotPlugin):
         bot_content 是机器人的回复；空字符串表示机器人选择沉默，
         此时插入统一占位符 "...（已读未回）"，让对话轮次保持完整，
         避免 LLM 下一轮重复尝试回复同一条消息。
+
+        历史里存的是 LangChain 消息对象（HumanMessage / AIMessage），
+        图片不进历史，只留纯文本。
         """
-        self.assistent_messages.append({"role": "user", "content": message})
+        self.assistent_messages.append(HumanMessage(content=message))
         bot_text = bot_content if bot_content else "...（已读未回）"
-        self.assistent_messages.append({"role": "assistant", "content": bot_text})
+        self.assistent_messages.append(AIMessage(content=bot_text))
         # 滑动窗口
         if len(self.assistent_messages) > self.max_k:
             self.assistent_messages = self.assistent_messages[-self.max_k:]
@@ -387,7 +364,7 @@ class AIPlugin(NcatBotPlugin):
 
     async def resolve_message_multimodal(
         self, messages: MessageArray
-    ) -> tuple[str, List[Dict[str, Any]]]:
+    ) -> tuple[str, Sequence[Dict[str, Any]]]:
         """把 MessageArray 拆成 (纯文本, 多模态 parts)。
         """
         text_buf: list[str] = []
