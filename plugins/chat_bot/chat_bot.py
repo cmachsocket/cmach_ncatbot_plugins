@@ -64,7 +64,8 @@ class ChatAgentState(AgentState):
 global_limiter = ToolCallLimitMiddleware(run_limit=1)
 
 
-@tool("send_message",return_direct=True)
+
+@tool("send_message",return_direct=True,description="向当前群聊发送一条消息。reply=true 表示发送；false 表示选择不发送！")
 async def send_message_tool(
     content: str,
     reply: bool = False,
@@ -73,7 +74,7 @@ async def send_message_tool(
     event: Annotated[Any, InjectedState("event")] = None,
     user_msg: Annotated[str, InjectedState("user_msg")] = "",
 ) -> str:
-    """向当前群聊发送一条消息。reply=true 表示回复当前用户；false 表示选择不回复。"""
+    """向当前群聊发送一条消息。reply=true 表示发送；false 表示选择不发送！"""
     if plugin is None:
         # 没注入到就说明 state 没带上，后面只用 plugin，直接早退更清楚
         LOG.error("send_message_tool 未拿到 plugin，state 可能缺少 plugin 字段")
