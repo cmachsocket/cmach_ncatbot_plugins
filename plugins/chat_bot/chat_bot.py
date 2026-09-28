@@ -446,7 +446,8 @@ class AIPlugin(NcatBotPlugin):
         async with self._bank_lock:
             self._set_hindsight_bank(bank_id)
             resp = await self.agent.ainvoke(state, verbose=True)
-            LOG.info(f"chat response: {resp.text}")
+            last_msg = resp["messages"][-1]
+            LOG.info(f"chat response: {last_msg.content}")
         return resp
 
     async def _send_to_group(
