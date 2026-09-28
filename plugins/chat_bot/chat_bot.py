@@ -115,8 +115,13 @@ class AIPlugin(NcatBotPlugin):
     _last_user_msg_at: float = 0.0
     model : str
     api_key : str
-    base_url : str 
+    base_url : str
     chat_llm : Optional[ChatLiteLLM] = None
+    agent: Any = None
+    # hindsight 记忆库：群消息按 user_id 分库，主动说话固定用 self
+    PROACTIVE_BANK_ID: str = "self"
+    # 共用同一个 chat_llm，切 bank_id 时要串行，避免并发调用互相污染
+    _bank_lock: asyncio.Lock = asyncio.Lock()
     # ---- 主动说话参数 ----
     # 群沉默超过这个秒数才开始计算主动说话概率
     PROACTIVE_SILENCE_THRESHOLD_S: float = 3.0 * 3600.0
@@ -156,6 +161,11 @@ class AIPlugin(NcatBotPlugin):
                 model=self.model,
                 api_key=self.api_key,
                 api_base=self.base_url,
+                # hindsight_litellm.enable() 已 patch 了 litellm.acompletion，
+                # ChatLiteLLM 底层走的就是它，所以记忆注入/落库自动生效。
+                # hindsight_bank_id 从 model_kwargs 进，每次调用前由
+                # _set_hindsight_bank 改写，区分不同用户的记忆库。
+                model_kwargs={"hindsight_bank_id": self.PROACTIVE_BANK_ID},
             )
         if self.chat_llm:
             self.agent = create_agent(
@@ -234,16 +244,16 @@ class AIPlugin(NcatBotPlugin):
         state: InputAgentState = {
             "messages": [system_chat, *history, user_chat]
         }
-        result = await self.agent.ainvoke(
-                    state,
-                    config={
-                        "configurable": {
-                            "plugin": self,
-                            "event": event,
-                            "user_msg": prefixed_text,   # 当前这轮用户消息，供 add_context 用
-                        }
-                    },
-)
+        # 每个群成员一个记忆库，和旧的 hindsight_bank_id=uid 行为一致
+        await self._run_agent(
+            state,
+            bank_id=uid,
+            context={
+                "plugin": self,
+                "event": event,
+                "user_msg": prefixed_text,   # 当前这轮用户消息，供 add_context 用
+            },
+        )
         
 
     async def _proactive_loop(self) -> None:
@@ -291,20 +301,50 @@ class AIPlugin(NcatBotPlugin):
                 state: InputAgentState = {
                     "messages": [proactive_system, *history]
                 }
-                result = await self.agent.ainvoke(
-                            state,
-                            config={
-                                "configurable": {
-                                    "plugin": self,
-                                    # event 不传，工具里走 target_group_id 分支
-                                    "user_msg": "",   # 主动说话没有用户消息
-                                }
-                            },
-                        )
+                # 主动说话的记忆单独存在 self 库里，不跟群成员混
+                await self._run_agent(
+                    state,
+                    bank_id=self.PROACTIVE_BANK_ID,
+                    context={
+                        "plugin": self,
+                        # event 不传，工具里走 target_group_id 分支
+                        "user_msg": "",   # 主动说话没有用户消息
+                    },
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.logger.warning("proactive loop error: %s", e)
+
+    def _set_hindsight_bank(self, bank_id: str) -> None:
+        """把下一次 LLM 调用的 hindsight 记忆库切到 bank_id。
+
+        chat_llm 是全局共用的，hindsight_bank_id 挂在它的 model_kwargs 上，
+        每次调用 litellm 时才会被读走。所以这里只改值，真正的生效点在
+        下面的 _run_agent 调用（必须紧挨着 ainvoke，中间不能有别的调用）。
+        """
+        if self.chat_llm is None:
+            return
+        kwargs = dict(self.chat_llm.model_kwargs or {})
+        kwargs["hindsight_bank_id"] = bank_id
+        self.chat_llm.model_kwargs = kwargs
+
+    async def _run_agent(
+        self,
+        state: InputAgentState,
+        bank_id: str,
+        context: Dict[str, Any],
+    ) -> Any:
+        """在指定 hindsight 记忆库下跑一次 agent。
+
+        切 bank 和 ainvoke 必须成对加锁：bank_id 挂在共享的 chat_llm 上，
+        若中途被别的协程改掉，这次调用的记忆就会记到别人账上。
+        """
+        if self.agent is None:
+            raise RuntimeError("agent 未初始化，请检查 ai 适配器配置")
+        async with self._bank_lock:
+            self._set_hindsight_bank(bank_id)
+            return await self.agent.ainvoke(state, config={"configurable": context})
 
     def _count_tools_tokens(self) -> int:
         """工具定义 + tool_choice 占用的 token 数。
