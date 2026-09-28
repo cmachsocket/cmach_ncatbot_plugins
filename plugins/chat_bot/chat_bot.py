@@ -217,15 +217,17 @@ class AIPlugin(NcatBotPlugin):
         raw_text = event.message.text.strip()
         if not raw_text and not event.message.filter_image():
             return
-
+    
         uid = str(event.user_id)
+        if uid == self.bot_id:
+            # 机器人自己发的消息不处理，避免死循环
+            return
         now = time.monotonic()
         # 记录真实用户消息时间，供主动说话心跳判断『沉默多久』
         self._last_user_msg_at = now
 
         at_list = event.message.filter_at()
         is_at_me = any(str(at.user_id) == self.bot_id for at in at_list)
-        has_image = bool(event.message.filter(Image))
 
         user_name = await self.get_user_name(event.user_id)
         # 同时拿到：① 纯文本（用于历史）② 多模态 parts（用于本轮 LLM 调用）
@@ -255,7 +257,10 @@ class AIPlugin(NcatBotPlugin):
         token_budget = self.temperature_controller.temperature_to_token_budget(
             temperature
         )
-
+        if is_at_me:
+            is_at_chat = SystemMessage(content="你被 @ 了，必须回复。")
+        else:
+            is_at_chat = SystemMessage(content="你没有被 @，可以选择不回复。")
         system_chat = SystemMessage(content=SYSTEM_PROMPT)
         user_chat = HumanMessage(content=user_chat_content)
 
@@ -274,7 +279,7 @@ class AIPlugin(NcatBotPlugin):
         # ) 以后修改逻辑，send_message 工具里不再 add_context，避免重复 add
         # 每个群成员一个记忆库，和旧的 hindsight_bank_id=uid 行为一致
         await self._run_agent(
-            [system_chat, self.get_now_time(), *history, user_chat],
+            [system_chat, is_at_chat, self.get_now_time(), *history, user_chat],
             bank_id=uid,
             event=event,
             user_msg=prefixed_text,   # 当前这轮用户消息，供 add_context 用
