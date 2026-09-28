@@ -9,7 +9,7 @@ import concurrent.futures
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 from ncatbot.utils import get_log
 
 from ncatbot.types import MessageArray,Reply,PlainText,At,Image
@@ -98,8 +98,8 @@ class AIPlugin(NcatBotPlugin):
     target_group_id: int = 1093424135
     bot_id: Optional[str] = None
     assistent_messages: List[Dict[str, str]] = []  # 用于存储上下文
-    max_k: int = 60  # 历史消息缓存上限
-    dynamic_k: int = 40  # 温度动态调节的基准上下文窗口
+    max_k: int = 60  # 历史消息条数缓存上限（内存层面，token 由 context_budget 限制）
+    context_budget: int = 4096  # 上下文 token 预算上限
     _bg_task: Optional[asyncio.Task[None]] = None
     # 上次收到真实用户消息的 monotonic 时间，用于主动说话沉默计时
     _last_user_msg_at: float = 0.0
@@ -117,7 +117,9 @@ class AIPlugin(NcatBotPlugin):
     async def on_load(self) -> None:
         self.assistent_messages = []
         self._last_user_msg_at = time.monotonic()
-        self.temperature_controller = TemperatureController(window_max=self.dynamic_k)
+        self.temperature_controller = TemperatureController(
+            token_max=self.get_config("CONTEXT_TOKEN_BUDGET", 4096),
+        )
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
         #self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}")
@@ -177,13 +179,26 @@ class AIPlugin(NcatBotPlugin):
             prefixed_text, temperature, now
         ):
             temperature = self.temperature_controller.reheat(now)
-        context_window = self.temperature_controller.temperature_to_window(temperature)
+        # 温度 → token 预算，再从历史尾部取能塞进预算的连续片段
+        token_budget = self.temperature_controller.temperature_to_token_budget(
+            temperature
+        )
 
         system_chat = [{"role": "system", "content": SYSTEM_PROMPT}]
         user_chat = [{"role": "user", "content": user_chat_content}]
 
+        # system prompt + 工具定义 + 本轮用户消息是固定开销，先扣掉，
+        # 剩下的预算才分给历史，否则总长度会顶穿 token 上限
+        fixed_tokens = (
+            self.temperature_controller.count_total_tokens(system_chat + user_chat)
+            + self._count_tools_tokens()
+        )
+        history = self.temperature_controller.select_context_by_tokens(
+            self.assistent_messages, token_budget, reserve=fixed_tokens
+        )
+
         resp = await self.api.ai.chat(
-            system_chat + self.assistent_messages[-context_window:] + user_chat,
+            system_chat + history + user_chat,
             tools=TOOLS_SCHEMA,
             tool_choice={
                 "type": "function",
@@ -252,11 +267,22 @@ class AIPlugin(NcatBotPlugin):
                     continue
                 if not self.assistent_messages:
                     continue
-                # 让模型自创一句
-                prompt_msgs = [
-                    {"role": "system", "content": SYSTEM_PROMPT
-                        + "\n[模式] 主动发起话题。不一定与记忆相关，也不一定与当前群聊的最新消息相关。可以是一个问题、一个建议、一个有趣的想法、一个冷知识、一个笑话等。"}
-                ] + self.assistent_messages[-8:]
+                # 让模型自创一句。主动说话只需要一点近期上下文，
+                # 用固定 token 预算而不是固定条数
+                proactive_system = {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT
+                    + "\n[模式] 主动发起话题。不一定与记忆相关，也不一定与当前群聊的最新消息相关。可以是一个问题、一个建议、一个有趣的想法、一个冷知识、一个笑话等。",
+                }
+                reserve = self.temperature_controller.count_total_tokens(
+                    [proactive_system]
+                ) + self._count_tools_tokens()
+                history = self.temperature_controller.select_context_by_tokens(
+                    self.assistent_messages,
+                    self.context_budget,
+                    reserve=reserve,
+                )
+                prompt_msgs = [proactive_system] + history
                 resp = await self.api.ai.chat(
                     prompt_msgs,
                     tools=TOOLS_SCHEMA,
@@ -285,6 +311,34 @@ class AIPlugin(NcatBotPlugin):
                 break
             except Exception as e:
                 self.logger.warning("proactive loop error: %s", e)
+
+    def _count_tools_tokens(self) -> int:
+        """工具定义 + tool_choice 占用的 token 数。
+
+        工具 schema 每轮都要发，和 system prompt 一样是固定开销。
+        """
+        from litellm import token_counter
+
+        try:
+            return int(
+                token_counter(
+                    messages=[{"role": "system", "content": ""}],
+                    # TOOLS_SCHEMA 是普通 dict 字面量，litellm 声明的是
+                    # ChatCompletionToolParam；结构上等价，这里 cast 一下过类型检查
+                    tools=cast(Any, TOOLS_SCHEMA),
+                    tool_choice=cast(
+                        Any,
+                        {
+                            "type": "function",
+                            "function": {"name": "send_message"},
+                        },
+                    ),
+                    use_default_image_token_count=True,
+                )
+            )
+        except Exception as e:
+            self.logger.warning("统计工具定义 token 失败: %s", e)
+            return 0
 
     async def _send_to_group(
         self, event: GroupMessageEvent, content: str
@@ -330,50 +384,11 @@ class AIPlugin(NcatBotPlugin):
         card: str = getattr(member_info, "card", "") or ""
         nickname: str = getattr(member_info, "nickname", "") or ""
         return card or nickname or "未知用户"
-    async def resolve_message(self, messages: MessageArray) -> str:
-        """把 MessageArray 解析成纯文本，用于历史/日志。
-
-        图片在历史里只保留 [图片] 占位，不存 url/数据。
-        Reply 引用块、@ 这些行为保持原样。
-        """
-        message = ""
-        reply_msg = "<quote>\n"
-        reply_ids = messages.filter(Reply)
-        for reply in reply_ids:
-            message_data=await self.api.qq.query.get_msg(reply.id)
-            if message_data is None:
-                continue
-            if message_data.sender is not None and message_data.sender.user_id is not None:
-                name = await self.get_user_name(message_data.sender.user_id)
-            else:
-                name = "未知用户"
-            # get_msg 返回 MessageData，消息段列表位于其 message 属性中。
-            reply_msg += f"{name}：{MessageArray.from_list(message_data.message or []).text}\n"
-        reply_msg += "</quote>\n"
-        if(len(reply_ids) > 0):
-            message += reply_msg
-        for msg in messages:
-            if isinstance(msg, PlainText):
-                message += msg.text
-            elif isinstance(msg, At):
-                name = await self.get_user_name(msg.user_id)
-                message += f"@{name} "
-            elif isinstance(msg, Image):
-                # 历史里不要存图片 url/数据，只留一句占位
-                message += "[图片] "
-        LOG.info(f"resolve_message: {message}")
-        return message
 
     async def resolve_message_multimodal(
         self, messages: MessageArray
     ) -> tuple[str, List[Dict[str, Any]]]:
         """把 MessageArray 拆成 (纯文本, 多模态 parts)。
-
-        多模态 parts 用 OpenAI content 格式：[{type: text}, {type: image_url}, ...]
-        当消息里没有任何图片时，第二项是空列表；调用方在两种情况下都需要
-        把"纯文本"作为历史里写入的内容。
-
-        实现参考 ncatbot 内部的 _convert_message_array，但保持独立，不依赖私有 API。
         """
         text_buf: list[str] = []
 

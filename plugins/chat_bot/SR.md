@@ -72,19 +72,20 @@ def current_T():
     dt = time.monotonic() - t_base
     return T_min + (T_base - T_min) * math.exp(-dt / tau)
 
-def T_to_window(T):
-    # 对数映射到 [L_min, L_max]
+def T_to_budget(T):
+    # 对数映射到 token 预算区间 [budget_min, budget_max]
     p = (math.log(T) - math.log(T_min)) / (math.log(T0) - math.log(T_min))
     p = max(0.0, min(1.0, p))
-    return int(L_min + p * (L_max - L_min))
+    return int(budget_min + p * (budget_max - budget_min))
 
 def on_dialog_turn(query):
     global T_base, t_base
 
     T = current_T()
-    L = T_to_window(T)
+    budget = T_to_budget(T)
 
-    context = build_context(window_size=L, query=query)
+    # 预算按 token 计（不是消息条数），从历史尾部往前取到用满为止
+    context = build_context(token_budget=budget, query=query)
     output = llm(context)
 
     if should_reheat(output, query):
