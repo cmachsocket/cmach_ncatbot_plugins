@@ -391,7 +391,12 @@ class AIPlugin(NcatBotPlugin):
         """向当前群聊发送一条消息。"""
         if not content.strip():
             return
-        await self.api.qq.send_group_text(event.group_id, content)
+        messages = content.splitlines()
+        for msg in messages:
+            if not msg.strip():
+                continue
+            await self.api.qq.send_group_text(event.group_id, msg)
+            await asyncio.sleep(1)  # 避免发太快
     def is_target_group(self, group_id: int | str) -> bool:
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
