@@ -3,7 +3,6 @@ from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 import hindsight_litellm
 from .time_controller import TemperatureController, count_tools_tokens
-import json
 import asyncio
 import concurrent.futures
 import random
@@ -172,7 +171,11 @@ class AIPlugin(NcatBotPlugin):
                 self.chat_llm,
                 tools=[send_message_tool],
             )
-    
+    def get_now_time(self) -> SystemMessage:
+        """获取当前时间，返回 SystemMessage 形式，供 LLM 使用"""
+        now = time.localtime()
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", now)
+        return SystemMessage(content=f"[当前时间] {now_str}")
     @registrar.qq.on_group_message()
     async def ai_chat(self, event: GroupMessageEvent) -> None:
         """AI 对话：LLM 通过 send_message 工具自行决定『要不要回/说什么』。
@@ -242,7 +245,7 @@ class AIPlugin(NcatBotPlugin):
         #     message=prefixed_text,
         # ) 以后修改逻辑，send_message 工具里不再 add_context，避免重复 add
         state: InputAgentState = {
-            "messages": [system_chat, *history, user_chat]
+            "messages": [system_chat,self.get_now_time(), *history, user_chat]
         }
         # 每个群成员一个记忆库，和旧的 hindsight_bank_id=uid 行为一致
         await self._run_agent(
@@ -299,7 +302,7 @@ class AIPlugin(NcatBotPlugin):
                     reserve=reserve,
                 )
                 state: InputAgentState = {
-                    "messages": [proactive_system, *history]
+                    "messages": [proactive_system,self.get_now_time(), *history]
                 }
                 # 主动说话的记忆单独存在 self 库里，不跟群成员混
                 await self._run_agent(
