@@ -45,7 +45,7 @@ class ChatAgentState(AgentState):
     user_msg: NotRequired[str]
 
 
-@tool("send_message")
+@tool("send_message",return_direct=True)
 async def send_message_tool(
     content: str,
     reply: bool = False,
@@ -384,7 +384,7 @@ class AIPlugin(NcatBotPlugin):
         LOG.info("agent run: bank_id=%s", bank_id)
         async with self._bank_lock:
             self._set_hindsight_bank(bank_id)
-            return await self.agent.ainvoke(state)
+            return await self.agent.ainvoke(state,verbose=True)
 
     def _count_tools_tokens(self) -> int:
         """工具定义 + tool_choice 占用的 token 数。
