@@ -9,33 +9,56 @@ import random
 import time
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional, Sequence, Union
+from typing_extensions import NotRequired
 from ncatbot.utils import get_log
 
 from ncatbot.types import MessageArray,Reply,PlainText,At,Image
 
-from langchain.agents import create_agent
-from langchain.agents.middleware.types import InputAgentState
+from langchain.agents import AgentState, create_agent
+from langgraph.prebuilt.tool_node import InjectedState
 from langchain_litellm import ChatLiteLLM
 from ncatbot.utils import get_config_manager
 from langchain_core.messages import (
     AIMessage,
+    AnyMessage,
     HumanMessage,
     SystemMessage,
 )
-from langchain_core.tools import tool, InjectedToolArg
+from langchain_core.tools import tool
 
 LOG = get_log("AIPlugin")
+
+
+class ChatAgentState(AgentState):
+    """在 agent 默认 state 上挂三个运行期参数。
+
+    send_message_tool 需要拿到 plugin / event / user_msg，但这些既不该暴露给
+    LLM（InjectedState 会自动从 tool schema 里剔除），也不适合走
+    config["configurable"] —— InjectedToolArg 本身没有注入来源，只有
+    InjectedState / InjectedStore / ToolRuntime 才会被 langgraph 真正填充。
+    所以放进 state，由 InjectedState("字段名") 取。
+    """
+
+    plugin: NotRequired[Any]
+    event: NotRequired[Any]
+    user_msg: NotRequired[str]
+
 
 @tool("send_message")
 async def send_message_tool(
     content: str,
     reply: bool = False,
-    # 下面三个参数 LLM 看不到，从 config 注入
-    plugin: Annotated[Any, InjectedToolArg] = None,
-    event: Annotated[Any, InjectedToolArg] = None,
-    user_msg: Annotated[str, InjectedToolArg] = "",
+    # 下面三个参数 LLM 看不到，由 langgraph 从 agent state 注入
+    plugin: Annotated[Any, InjectedState("plugin")] = None,
+    event: Annotated[Any, InjectedState("event")] = None,
+    user_msg: Annotated[str, InjectedState("user_msg")] = "",
 ) -> str:
     """向当前群聊发送一条消息。reply=true 表示回复当前用户；false 表示选择不回复。"""
+    if plugin is None:
+        # 没注入到就说明 state 没带上，后面只用 plugin，直接早退更清楚
+        LOG.error("send_message_tool 未拿到 plugin，state 可能缺少 plugin 字段")
+        return "error: missing plugin"
+
     if not reply or not content.strip():
         LOG.info("模型选择不回复")
         plugin.add_context(bot_content="", message=user_msg)
@@ -49,6 +72,8 @@ async def send_message_tool(
 
     plugin.add_context(bot_content=content, message=user_msg)
     return "sent"
+
+
 def _patch_hindsight_run_async() -> None:
     """Monkey patch hindsight_client._run_async to be safe inside a running event loop.
 
@@ -170,6 +195,9 @@ class AIPlugin(NcatBotPlugin):
             self.agent = create_agent(
                 self.chat_llm,
                 tools=[send_message_tool],
+                # 带上自定义 state，send_message_tool 靠 InjectedState
+                # 从这里取 plugin / event / user_msg
+                state_schema=ChatAgentState,
             )
     def get_now_time(self) -> SystemMessage:
         """获取当前时间，返回 SystemMessage 形式，供 LLM 使用"""
@@ -244,18 +272,12 @@ class AIPlugin(NcatBotPlugin):
         #     bot_content="",  
         #     message=prefixed_text,
         # ) 以后修改逻辑，send_message 工具里不再 add_context，避免重复 add
-        state: InputAgentState = {
-            "messages": [system_chat,self.get_now_time(), *history, user_chat]
-        }
         # 每个群成员一个记忆库，和旧的 hindsight_bank_id=uid 行为一致
         await self._run_agent(
-            state,
+            [system_chat, self.get_now_time(), *history, user_chat],
             bank_id=uid,
-            context={
-                "plugin": self,
-                "event": event,
-                "user_msg": prefixed_text,   # 当前这轮用户消息，供 add_context 用
-            },
+            event=event,
+            user_msg=prefixed_text,   # 当前这轮用户消息，供 add_context 用
         )
         
 
@@ -301,18 +323,14 @@ class AIPlugin(NcatBotPlugin):
                     self.context_budget,
                     reserve=reserve,
                 )
-                state: InputAgentState = {
-                    "messages": [proactive_system,self.get_now_time(), *history]
-                }
-                # 主动说话的记忆单独存在 self 库里，不跟群成员混
+                # 主动说话的记忆单独存在 self 库里，不跟群成员混。
+                # event 传 None，工具里走 target_group_id 分支；
+                # user_msg 留空，主动说话没有用户消息。
                 await self._run_agent(
-                    state,
+                    [proactive_system, self.get_now_time(), *history],
                     bank_id=self.PROACTIVE_BANK_ID,
-                    context={
-                        "plugin": self,
-                        # event 不传，工具里走 target_group_id 分支
-                        "user_msg": "",   # 主动说话没有用户消息
-                    },
+                    event=None,
+                    user_msg="",
                 )
             except asyncio.CancelledError:
                 break
@@ -334,20 +352,30 @@ class AIPlugin(NcatBotPlugin):
 
     async def _run_agent(
         self,
-        state: InputAgentState,
+        messages: List[AnyMessage],
         bank_id: str,
-        context: Dict[str, Any],
+        event: Any = None,
+        user_msg: str = "",
     ) -> Any:
         """在指定 hindsight 记忆库下跑一次 agent。
+
+        event / user_msg 放进 state（不是 config["configurable"]），这样
+        send_message_tool 能通过 InjectedState 拿到它们。
 
         切 bank 和 ainvoke 必须成对加锁：bank_id 挂在共享的 chat_llm 上，
         若中途被别的协程改掉，这次调用的记忆就会记到别人账上。
         """
         if self.agent is None:
             raise RuntimeError("agent 未初始化，请检查 ai 适配器配置")
+        state: ChatAgentState = {
+            "messages": messages,
+            "plugin": self,
+            "event": event,
+            "user_msg": user_msg,
+        }
         async with self._bank_lock:
             self._set_hindsight_bank(bank_id)
-            return await self.agent.ainvoke(state, config={"configurable": context})
+            return await self.agent.ainvoke(state)
 
     def _count_tools_tokens(self) -> int:
         """工具定义 + tool_choice 占用的 token 数。
