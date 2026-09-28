@@ -15,6 +15,7 @@ from ncatbot.utils import get_log
 from ncatbot.types import MessageArray,Reply,PlainText,At,Image
 
 from langchain.agents import AgentState, create_agent
+from langchain.agents.middleware import ToolCallLimitMiddleware
 from langgraph.prebuilt.tool_node import InjectedState
 from langchain_litellm import ChatLiteLLM
 from ncatbot.utils import get_config_manager
@@ -28,7 +29,7 @@ from langchain_core.tools import tool
 
 LOG = get_log("AIPlugin")
 
-
+global_limiter = ToolCallLimitMiddleware(run_limit=1)
 class ChatAgentState(AgentState):
     """在 agent 默认 state 上挂三个运行期参数。
 
@@ -195,6 +196,7 @@ class AIPlugin(NcatBotPlugin):
             self.agent = create_agent(
                 self.chat_llm,
                 tools=[send_message_tool],
+                middleware=[global_limiter],
                 # 带上自定义 state，send_message_tool 靠 InjectedState
                 # 从这里取 plugin / event / user_msg
                 state_schema=ChatAgentState,
