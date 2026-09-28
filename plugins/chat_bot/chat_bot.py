@@ -2,34 +2,43 @@ from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 import hindsight_litellm
-from .time_controller import TemperatureController, count_tools_tokens
+from .time_controller import (
+    TemperatureController,
+)
 import asyncio
 import concurrent.futures
 import random
 import time
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, Sequence, Union
+from typing import Annotated, Any, Dict, Iterable, List, Optional, Sequence, Union
 from typing_extensions import NotRequired
+from uuid import uuid4
 from ncatbot.utils import get_log
 
 from ncatbot.types import MessageArray,Reply,PlainText,At,Image
 
 from langchain.agents import AgentState, create_agent
-from langchain.agents.middleware import ToolCallLimitMiddleware
+from langchain.agents.middleware import (
+    SummarizationMiddleware,
+    ToolCallLimitMiddleware,
+)
+from langgraph.graph.message import add_messages
 from langgraph.prebuilt.tool_node import InjectedState
 from langchain_litellm import ChatLiteLLM
 from ncatbot.utils import get_config_manager
 from langchain_core.messages import (
     AIMessage,
-    AnyMessage,
+    BaseMessage,
     HumanMessage,
     SystemMessage,
+    convert_to_messages,
+    trim_messages,
 )
 from langchain_core.tools import tool
 
 LOG = get_log("AIPlugin")
 
-global_limiter = ToolCallLimitMiddleware(run_limit=1)
+
 class ChatAgentState(AgentState):
     """在 agent 默认 state 上挂三个运行期参数。
 
@@ -38,11 +47,19 @@ class ChatAgentState(AgentState):
     config["configurable"] —— InjectedToolArg 本身没有注入来源，只有
     InjectedState / InjectedStore / ToolRuntime 才会被 langgraph 真正填充。
     所以放进 state，由 InjectedState("字段名") 取。
+
+    messages 不覆盖：AgentState 里已经是 Annotated[..., add_messages]，
+    继承即可，langgraph 会按消息 id 合并，ToolMessage 也能正常并入历史。
     """
 
     plugin: NotRequired[Any]
     event: NotRequired[Any]
     user_msg: NotRequired[str]
+
+
+# middleware 的泛型参数填 ChatAgentState，这样它们和 state_schema 一致，
+# 否则 ToolCallLimitMiddleware 会去要自己的 ToolCallLimitState。
+global_limiter = ToolCallLimitMiddleware(run_limit=1)
 
 
 @tool("send_message",return_direct=True)
@@ -133,8 +150,10 @@ class AIPlugin(NcatBotPlugin):
     bot_id: Optional[str] = None
     # 历史里只有 HumanMessage / AIMessage 两种，不含 ToolMessage 等
     assistent_messages: List[Union[HumanMessage, AIMessage]] = []
-    max_k: int = 60  # 历史消息条数缓存上限（内存层面，token 由 context_budget 限制）
-    context_budget: int = 4096  # 上下文 token 预算上限
+    max_k: int = 60  # 历史消息条数缓存上限（内存层面，token 由 token_base × 倍率 限制）
+    # 上下文 token 预算的基准值。实际预算 = 4096 × clamp(温度, 0.5, 1.5)
+    # 即 2048 ~ 6144 之间浮动，由 TemperatureController 计算。
+    context_budget: int = 4096
     _bg_task: Optional[asyncio.Task[None]] = None
     # 上次收到真实用户消息的 monotonic 时间，用于主动说话沉默计时
     _last_user_msg_at: float = 0.0
@@ -161,7 +180,7 @@ class AIPlugin(NcatBotPlugin):
         self.assistent_messages = []
         self._last_user_msg_at = time.monotonic()
         self.temperature_controller = TemperatureController(
-            token_max=self.get_config("CONTEXT_TOKEN_BUDGET", 4096),
+            token_base=self.get_config("CONTEXT_TOKEN_BUDGET", 4096),
         )
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
@@ -193,10 +212,25 @@ class AIPlugin(NcatBotPlugin):
                 model_kwargs={"hindsight_bank_id": self.PROACTIVE_BANK_ID},
             )
         if self.chat_llm:
+            # middleware 参数的 type: ignore 是必要的：langchain 1.4.2 把
+            # ToolCallLimitMiddleware 的 StateT 硬绑成它自己的
+            # ToolCallLimitState，与 AgentState 子类在类型上无法共存
+            # （不变量冲突）。运行时 create_agent 只读 state_schema，
+            # 不校验 middleware 的 StateT，所以行为是正确的。
             self.agent = create_agent(
                 self.chat_llm,
                 tools=[send_message_tool],
-                middleware=[global_limiter],
+                middleware=[
+                    global_limiter,  # type: ignore[arg-type]
+                    # 历史接近预算时让 LLM 压缩成摘要，而不是硬截断丢掉。
+                    # keep=('messages', 24) 表示压缩后保留最近 24 条原文。
+                    SummarizationMiddleware(
+                        self.chat_llm,
+                        trigger=("tokens", self.context_budget),
+                        keep=("messages", 24),
+                        token_counter=self._count_tokens,
+                    ),
+                ],
                 # 带上自定义 state，send_message_tool 靠 InjectedState
                 # 从这里取 plugin / event / user_msg
                 state_schema=ChatAgentState,
@@ -206,6 +240,13 @@ class AIPlugin(NcatBotPlugin):
         now = time.localtime()
         now_str = time.strftime("%Y-%m-%d %H:%M:%S", now)
         return SystemMessage(content=f"[当前时间] {now_str}")
+
+    def _count_tokens(self, messages: Iterable[Any]) -> int:
+        """委托 ChatLiteLLM 使用其 LangChain token 计数实现。"""
+        if self.chat_llm is None:
+            raise RuntimeError("chat_llm 未初始化，请检查 ai 适配器配置")
+        return self.chat_llm.get_num_tokens_from_messages(list(messages))
+
     @registrar.qq.on_group_message()
     async def ai_chat(self, event: GroupMessageEvent) -> None:
         """AI 对话：LLM 通过 send_message 工具自行决定『要不要回/说什么』。
@@ -268,12 +309,13 @@ class AIPlugin(NcatBotPlugin):
 
         # system prompt + 工具定义 + 本轮用户消息是固定开销，先扣掉，
         # 剩下的预算才分给历史，否则总长度会顶穿 token 上限
-        fixed_tokens = (
-            self.temperature_controller.count_total_tokens([system_chat, user_chat])
-            + self._count_tools_tokens()
-        )
-        history = self.temperature_controller.select_context_by_tokens(
-            self.assistent_messages, token_budget, reserve=fixed_tokens
+        fixed_tokens = self._count_tokens([system_chat, user_chat])
+        history = trim_messages(
+            self.assistent_messages,
+            max_tokens=max(1, token_budget - fixed_tokens),
+            token_counter=self._count_tokens,
+            strategy="last",
+            start_on="human",
         )
         # self.add_context(
         #     bot_content="",  
@@ -318,18 +360,22 @@ class AIPlugin(NcatBotPlugin):
                 if not self.assistent_messages:
                     continue
                 # 让模型自创一句。主动说话只需要一点近期上下文，
-                # 用固定 token 预算而不是固定条数
+                # 用 token 预算而不是固定条数。
+                # 主动说话不按温度调节，用基准值（倍率 1.0）即可。
                 proactive_system = SystemMessage(
                     content=SYSTEM_PROMPT
                     + "\n[模式] 主动发起话题。不一定与记忆相关，也不一定与当前群聊的最新消息相关。可以是一个问题、一个建议、一个有趣的想法、一个冷知识、一个笑话等。"
                 )
-                reserve = self.temperature_controller.count_total_tokens(
-                    [proactive_system]
-                ) + self._count_tools_tokens()
-                history = self.temperature_controller.select_context_by_tokens(
+                reserve = self._count_tokens([proactive_system])
+                proactive_budget = (
+                    self.temperature_controller.temperature_to_token_budget(1.0)
+                )
+                history = trim_messages(
                     self.assistent_messages,
-                    self.context_budget,
-                    reserve=reserve,
+                    max_tokens=max(1, proactive_budget - reserve),
+                    token_counter=self._count_tokens,
+                    strategy="last",
+                    start_on="human",
                 )
                 # 主动说话的记忆单独存在 self 库里，不跟群成员混。
                 # event 传 None，工具里走 target_group_id 分支；
@@ -360,7 +406,7 @@ class AIPlugin(NcatBotPlugin):
 
     async def _run_agent(
         self,
-        messages: List[AnyMessage],
+        messages: Sequence[BaseMessage],
         bank_id: str,
         event: Any = None,
         user_msg: str = "",
@@ -375,24 +421,21 @@ class AIPlugin(NcatBotPlugin):
         """
         if self.agent is None:
             raise RuntimeError("agent 未初始化，请检查 ai 适配器配置")
-        state: ChatAgentState = {
-            "messages": messages,
-            "plugin": self,
-            "event": event,
-            "user_msg": user_msg,
-        }
+        # convert_to_messages 是 langchain 内置的规范化函数：原样保留
+        # BaseMessage，把裸 dict / 元组转成对应消息对象。
+        # 下面 messages 上的 type: ignore 同理：AgentState.messages 标注为
+        # list[AnyMessage]，但所有 langchain 构造函数（含 convert_to_messages）
+        # 都返回 list[BaseMessage]，而 AnyMessage 联合不含 BaseMessage 本身。
+        state = ChatAgentState(
+            messages=convert_to_messages(messages),  # type: ignore[arg-type]
+            plugin=self,
+            event=event,
+            user_msg=user_msg,
+        )
         LOG.info("agent run: bank_id=%s", bank_id)
         async with self._bank_lock:
             self._set_hindsight_bank(bank_id)
-            return await self.agent.ainvoke(state,verbose=True)
-
-    def _count_tools_tokens(self) -> int:
-        """工具定义 + tool_choice 占用的 token 数。
-
-        工具 schema 每轮都要发，和 system prompt 一样是固定开销。
-        实际统计逻辑在 time_controller.count_tools_tokens。
-        """
-        return count_tools_tokens([send_message_tool], send_message_tool.name)
+            return await self.agent.ainvoke(state, verbose=True)
 
     async def _send_to_group(
         self, event: GroupMessageEvent, content: str
@@ -420,13 +463,29 @@ class AIPlugin(NcatBotPlugin):
 
         历史里存的是 LangChain 消息对象（HumanMessage / AIMessage），
         图片不进历史，只留纯文本。
+
+        追加走 langgraph 的 add_messages reducer 而不是 list.append：
+        它会按消息 id 合并，重复调用同一条消息不会产生重复条目。
         """
-        self.assistent_messages.append(HumanMessage(content=message))
         bot_text = bot_content if bot_content else "...（已读未回）"
-        self.assistent_messages.append(AIMessage(content=bot_text))
-        # 滑动窗口
-        if len(self.assistent_messages) > self.max_k:
-            self.assistent_messages = self.assistent_messages[-self.max_k:]
+        # 保留 add_messages 的核心语义：按消息 id 合并，重复的 id 覆盖旧值
+        # 而不是追加一份。这里自己实现是因为 langgraph 1.4.2 的 Messages
+        # 类型别名里只写了 BaseMessage，没写 HumanMessage/AIMessage 子类，
+        # 传具体子类列表过不了类型检查（运行时是正常的）。
+        merged: Dict[str, Union[HumanMessage, AIMessage]] = {
+            m.id: m for m in self.assistent_messages if m.id is not None
+        }
+        for msg in (
+            HumanMessage(content=message, id=f"u-{uuid4().hex}"),
+            AIMessage(content=bot_text, id=f"a-{uuid4().hex}"),
+        ):
+            assert msg.id is not None  # 上面刚显式给了 id
+            merged[msg.id] = msg
+        history = list(merged.values())
+        # 滑动窗口：丢掉最旧的消息
+        if len(history) > self.max_k:
+            history = history[-self.max_k :]
+        self.assistent_messages = history
     async def get_user_name(self, user_id: int | str) -> str:
         """查询用户在该群的显示名，优先群昵称，回退到 QQ 昵称"""
         try:
