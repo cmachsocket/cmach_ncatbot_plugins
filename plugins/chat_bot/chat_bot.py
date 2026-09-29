@@ -43,15 +43,6 @@ LOG = get_log("AIPlugin")
 
 class ChatAgentState(AgentState):
     """在 agent 默认 state 上挂三个运行期参数。
-
-    send_message_tool 需要拿到 plugin / event / user_msg，但这些既不该暴露给
-    LLM（InjectedState 会自动从 tool schema 里剔除），也不适合走
-    config["configurable"] —— InjectedToolArg 本身没有注入来源，只有
-    InjectedState / InjectedStore / ToolRuntime 才会被 langgraph 真正填充。
-    所以放进 state，由 InjectedState("字段名") 取。
-
-    messages 不覆盖：AgentState 里已经是 Annotated[..., add_messages]，
-    继承即可，langgraph 会按消息 id 合并，ToolMessage 也能正常并入历史。
     """
 
     plugin: NotRequired[Any]
@@ -65,10 +56,16 @@ global_limiter = ToolCallLimitMiddleware(run_limit=1)
 
 
 
-@tool("send_message",return_direct=True,description="向当前群聊发送一条消息。reply=true 表示发送；false 表示选择不发送！")
+@tool("send_message",return_direct=True,description=
+      """向当前群聊发送一条消息。
+      content: 
+      reply: true 表示发送；false 表示选择不发送！
+      unlimit_length: 默认状态下会有20字符长度限制，设置为 true 可以取消限制。请保证你的确需要解除消息长度限制。一般而言不建议解除限制，群聊消息不应过长"""
+      )
 async def send_message_tool(
     content: str,
     reply: bool = False,
+    unlimit_length: bool = False,
     # 下面三个参数 LLM 看不到，由 langgraph 从 agent state 注入
     plugin: Annotated[Any, InjectedState("plugin")] = None,
     event: Annotated[Any, InjectedState("event")] = None,
@@ -90,7 +87,10 @@ async def send_message_tool(
     else:
         # 主动说话场景没有 event
         await plugin.api.qq.send_group_text(plugin.target_group_id, content)
-
+    if len(content) > 20 and not unlimit_length:
+        LOG.warning(
+            f"send_message_tool: content 长度 {len(content)} 超过 20"
+        )
     plugin.add_context(bot_content=content, message=user_msg)
     return "sent"
 
