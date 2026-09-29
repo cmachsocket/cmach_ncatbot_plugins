@@ -375,7 +375,9 @@ class AIPlugin(NcatBotPlugin):
                 # 主动说话不按温度调节，用基准值（倍率 1.0）即可。
                 proactive_system = SystemMessage(
                     content=SYSTEM_PROMPT
-                    + "\n[模式] 主动发起话题。不一定与记忆相关，也不一定与当前群聊的最新消息相关。可以是一个问题、一个建议、一个有趣的想法、一个冷知识、一个笑话等。"
+                    + """\n[模式] 主动发起话题。不一定与记忆相关，也不一定与当前群聊的最新消息相关。
+                    可以是一个问题、一个建议、一个有趣的想法、一个冷知识、一个笑话等。
+                    注意，不要再重复之前的话题，也不要重复之前的消息内容。"""
                 )
                 reserve = self._count_tokens([proactive_system])
                 proactive_budget = (
