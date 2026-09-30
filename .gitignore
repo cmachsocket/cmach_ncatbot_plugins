@@ -14,3 +14,4 @@ config.yml
 config.yaml
 .vscode/
 output/
+uv.lock
