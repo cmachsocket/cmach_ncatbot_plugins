@@ -22,7 +22,6 @@ from langchain.agents.middleware import (
     SummarizationMiddleware,
     ToolCallLimitMiddleware,
 )
-from langgraph.graph.message import add_messages
 from langgraph.prebuilt.tool_node import InjectedState
 from langchain_litellm import ChatLiteLLM
 from ncatbot.utils import get_config_manager
@@ -93,7 +92,6 @@ async def send_message_tool(
         )
     plugin.add_context(bot_content=content, message=user_msg)
     return "sent"
-
 
 def _patch_hindsight_run_async() -> None:
     """Monkey patch hindsight_client._run_async to be safe inside a running event loop.

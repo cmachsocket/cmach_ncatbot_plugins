@@ -1,0 +1,9 @@
+name = "cmach.top.send.rss.summary"
+version = "0.1.0"
+main = "rss.py"
+author = "cmach_socket"
+description = "Send rss summaries"
+entry_class = "RssSender"
+pip_dependencies = []
+
+[dependencies]

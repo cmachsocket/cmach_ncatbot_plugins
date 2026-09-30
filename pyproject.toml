@@ -12,4 +12,5 @@ dependencies = [
     "wakeonlan",
     "hindsight_litellm",
     "hindsight_client",
+    "apscheduler",
 ]

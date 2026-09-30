@@ -10,5 +10,7 @@ wheels/
 .venv
 logs/
 down/
+config.yml
 config.yaml
 .vscode/
+output/
