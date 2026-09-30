@@ -5,9 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "pikepdf==10.8.0"
     "img2pdf",
     "jmcomic",
-    "litellm",
+    "litellm==1.91.1",
     "ncatbot5",
     "wakeonlan",
     "hindsight_litellm",
