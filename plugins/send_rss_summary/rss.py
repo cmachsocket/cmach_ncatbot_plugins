@@ -28,9 +28,6 @@ class RssSender(NcatBotPlugin):
     async def send_rss_summary(self):
         config = rssfetch.load_config(CONFIG_PATH)
         report = await rssfetch.run(config)
-        # save_path 是相对路径时固定到插件目录，避免输出随启动目录漂移
-        if not Path(config.save_path).is_absolute():
-            config.save_path = str(CONFIG_PATH.parent / config.save_path)
         if report.summary_path is None:      # LLM 失败/未配齐/无条目时都是 None
             self.logger.error("RSS 摘要生成失败")
             return
