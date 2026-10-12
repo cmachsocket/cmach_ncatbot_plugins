@@ -2,8 +2,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from zoneinfo import ZoneInfo
+import asyncio
 
+from ncatbot.core import registrar
 from ncatbot.plugin import NcatBotPlugin
+from ncatbot.event.qq import PrivateMessageEvent
 from caldav import aio
 from icalendar import Calendar
 from icalendar.cal import Event as ICalEvent
@@ -33,6 +36,12 @@ DEFAULT_ALL_DAY_NOTIFY_MINUTE = 30
 
 #: 缺少时区信息的事件（尤其全天事件）按这个时区解释
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+
+#: 手动触发同步的命令名（含前缀，首 token 精确匹配）
+SYNC_COMMAND = "/sync_cal"
+
+#: 手动同步的超时秒数：CalDAV 服务器卡住时不至于把聊天命令挂死
+SYNC_TIMEOUT_SECONDS = 60
 
 
 class ChangeKind(Enum):
@@ -66,6 +75,7 @@ class NotifyPlugin(NcatBotPlugin):
     tz: ZoneInfo
     _jobs_by_uid: dict[str, set[str]]
     _last_full_sync: datetime
+    _sync_lock: asyncio.Lock
 
     async def on_load(self) -> None:
         self.caldav_url = self.config.get("CALDAV_URL", "https://caldav.icloud.com/")
@@ -82,6 +92,8 @@ class NotifyPlugin(NcatBotPlugin):
         )
         self.tz = self._resolve_timezone(str(self.config.get("timezone", DEFAULT_TIMEZONE)))
         self._jobs_by_uid = {}
+        # 手动 /sync_cal 与定时轮询共用这把锁，避免两者交错重排作业
+        self._sync_lock = asyncio.Lock()
         # 启动后首轮就是全量（sync_tokens 为空），从加载时刻起算全量周期
         self._last_full_sync = datetime.now(self.tz)
 
@@ -105,7 +117,7 @@ class NotifyPlugin(NcatBotPlugin):
                 'misfire_grace_time': 300,  # 允许延迟执行的秒数
             })
         self.scheduler.add_job(
-            self.poll_once,
+            self._scheduled_poll,
             trigger=IntervalTrigger(minutes=POLL_INTERVAL_MINUTES),
             id="caldav_poll",
             replace_existing=True,
@@ -314,21 +326,76 @@ class NotifyPlugin(NcatBotPlugin):
         finally:
             self._forget_job(uid, job_id)
 
-    async def poll_once(self) -> None:
-        """定时入口：拉取变更并重排通知作业。"""
+    async def _scheduled_poll(self) -> None:
+        """定时任务入口：拿锁跑一次普通轮询。"""
+        async with self._sync_lock:
+            await self.poll_once()
+
+    async def poll_once(self, force_full: bool = False) -> tuple[int, int]:
+        """定时入口：拉取变更并重排通知作业。
+
+        Args:
+            force_full: 丢弃 sync token 强制全量。带 token 的 REPORT 只返回
+                变更过的对象，所以"手动同步"必须走全量，否则在没有新变更时
+                拉回来是空的，看起来像没生效。
+
+        Returns:
+            (变更条数, 当前待发作业数)；拉取失败返回 (-1, 作业数)
+        """
         now = datetime.now(self.tz)
-        if now - self._last_full_sync >= timedelta(hours=FULL_SYNC_INTERVAL_HOURS):
+        if force_full or now - self._last_full_sync >= timedelta(
+            hours=FULL_SYNC_INTERVAL_HOURS
+        ):
             # 带 token 的 REPORT 只返回变更过的对象，纯重复事件不会被重新展开，
             # 于是"原本在窗口外、后来滚进窗口"的实例永远排不上提醒——提醒会在
             # 事件最后一次被编辑后 notify_window_days 天左右静默冻结。
             # 丢掉 token 强制全量，把窗口重新填满，顺带自愈任何状态漂移。
-            self.logger.info("到达全量同步周期，丢弃 sync token 重新全量拉取")
+            self.logger.info("丢弃 sync token 重新全量拉取")
             self.sync_tokens.clear()
             self._last_full_sync = now
         try:
             changes = await self.get_calendar_events()
         except Exception as exc:
             self.logger.error(f"拉取 CalDAV 失败: {exc}")
-            return
+            return -1, self._pending_job_count()
         if changes:
             await self.notify_events(changes)
+        return len(changes), self._pending_job_count()
+
+    def _pending_job_count(self) -> int:
+        return sum(len(jids) for jids in self._jobs_by_uid.values())
+
+    # ---------- 聊天命令 ----------
+
+    async def _handle_sync_command(self, event) -> None:
+        """/sync_cal：立刻全量同步一次，并回报结果。"""
+        # 与定时 poll_once 互斥：两者都会清 sync token 并重排作业，
+        # 交错执行会让作业表被互相覆盖成半截状态。
+        async with self._sync_lock:
+            try:
+                async with asyncio.timeout(SYNC_TIMEOUT_SECONDS):
+                    count, jobs = await self.poll_once(force_full=True)
+            except TimeoutError:
+                # CalDAV 服务器卡住：给个回执，别让命令石沉大海。
+                # 锁已随 async with 释放，后续指令仍可用。
+                self.logger.error(f"{SYNC_COMMAND} 同步超时（>{SYNC_TIMEOUT_SECONDS}s）")
+                await event.reply(text=f"同步超时（>{SYNC_TIMEOUT_SECONDS}s），详见日志。")
+                return
+            except Exception as exc:
+                self.logger.error(f"{SYNC_COMMAND} 同步异常: {exc}")
+                await event.reply(text="同步出错，详见日志。")
+                return
+
+        if count < 0:
+            await event.reply(text="同步失败，详见日志。")
+            return
+        await event.reply(
+            text=f"同步完成：{count} 条变更，当前待发提醒 {jobs} 条。"
+        )
+
+    # 只挂私聊。用 registrar.qq.* 而不是顶层 registrar.on_private_command：
+    # 后者 platform 默认 None，不会挂 PlatformFilter，命令会在其它平台的
+    # 私聊里误触发。
+    @registrar.qq.on_private_command(SYNC_COMMAND, ignore_case=True)
+    async def cmd_sync_cal_private(self, event: PrivateMessageEvent) -> None:
+        await self._handle_sync_command(event)
