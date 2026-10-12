@@ -2,11 +2,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from zoneinfo import ZoneInfo
-import asyncio
 
-from ncatbot.core import registrar
 from ncatbot.plugin import NcatBotPlugin
-from ncatbot.event.qq import PrivateMessageEvent
 from caldav import aio
 from icalendar import Calendar
 from icalendar.cal import Event as ICalEvent
