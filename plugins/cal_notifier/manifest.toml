@@ -2,11 +2,7 @@ name = "cmach.top.cal.notifier"
 version = "0.1.0"
 main = "notify.py"
 author = "cmach_socket"
-<<<<<<< HEAD
 description = "CalDAV calendar event notifier. Private command: /sync_cal"
-=======
-description = "CalDAV calendar event notifier. Commands: /sync_cal"
->>>>>>> e7afd2b8ffcde66a6af0be91f12876d7f8b30c4a
 entry_class = "NotifyPlugin"
 pip_dependencies = []
 

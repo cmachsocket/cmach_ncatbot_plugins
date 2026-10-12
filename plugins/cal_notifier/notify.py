@@ -4,6 +4,8 @@ from enum import Enum
 from zoneinfo import ZoneInfo
 
 from ncatbot.plugin import NcatBotPlugin
+from ncatbot.event.qq import PrivateMessageEvent
+from ncatbot.core import registrar
 from caldav import aio
 from icalendar import Calendar
 from icalendar.cal import Event as ICalEvent
@@ -15,6 +17,7 @@ from apscheduler.jobstores.base import JobLookupError
 from caldav import SynchronizableCalendarObjectCollection
 
 import recurring_ical_events
+import asyncio
 
 
 #: 通知作业 id 前缀，形如 caldav_notify:{uid}:{occurrence-id-iso}
