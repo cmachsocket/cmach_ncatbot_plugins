@@ -1,12 +1,31 @@
+from dataclasses import dataclass, field
+from enum import Enum
+
 from ncatbot.core import registrar
 from ncatbot.plugin import NcatBotPlugin
 from caldav import aio
-from ical.calendar_stream import CalendarStream
-from ical.event import Event
+from icalendar import Calendar
+from icalendar.cal import Component
+from icalendar.cal import Event as ICalEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from datetime import datetime
+import recurring_ical_events
 
+class ChangeKind(Enum):
+    ADDED = "added"
+    UPDATED = "updated"
+    DELETED = "deleted"
+
+
+@dataclass
+class Change:
+    href: str
+    kind: ChangeKind
+    # 会重复触发的事件(如 每周重复的会议)，可能会有多个 Event 对象，一个是主事件（如开会），一个是重复事件实例（如1月1日的重要会议），
+    # 一般而言，一个herf 对应一个事件。
+    events: list[ICalEvent] = field(default_factory=list)
 
 
 class NotifyPlugin(NcatBotPlugin):
@@ -15,6 +34,7 @@ class NotifyPlugin(NcatBotPlugin):
     caldav_password: str
     davclient: "aio.AsyncDAVClient"
     sync_tokens: dict[str, str]   # {calendar_url: sync_token}
+    snapshot: dict[str, str]      # {对象绝对URL: 完整 iCal 文本}
 
     async def on_load(self) -> None:
         self.caldav_url = self.config.get("CALDAV_URL", "https://caldav.icloud.com/")
@@ -34,6 +54,7 @@ class NotifyPlugin(NcatBotPlugin):
             password=self.caldav_password,
         )
         self.sync_tokens = {}
+        self.snapshot = {}
 
         self.scheduler = AsyncIOScheduler(
             timezone="Asia/Shanghai",
@@ -60,11 +81,21 @@ class NotifyPlugin(NcatBotPlugin):
             await self.davclient.close()
         self.logger.info(f"{self.name} 已卸载")
 
-    async def get_calendar_events(self) -> list[Event]:
+    @staticmethod
+    def _vevents(cal: Component) -> list[ICalEvent]:
+        # icalendar 的 walk() 静态标注是 list[Component]，这里收窄到 Event。
+        # 形参用 Component：Calendar 是它的子类，且 walk() 就定义在它上面。
+        return [c for c in cal.walk("VEVENT") if isinstance(c, ICalEvent)]
+
+    @classmethod
+    def _parse_ics(cls, ics: str) -> list[ICalEvent]:
+        return cls._vevents(Calendar.from_ical(ics))
+
+    async def get_calendar_events(self) -> list[Change]:
         principal = await self.davclient.get_principal()
         calendars = await self.davclient.get_calendars(principal)
 
-        events: list[Event] = []
+        changes: list[Change] = []
         for calendar in calendars:
             cal_url = str(calendar.url)
             old_token = self.sync_tokens.get(cal_url)
@@ -80,19 +111,39 @@ class NotifyPlugin(NcatBotPlugin):
             self.sync_tokens[cal_url] = collection.sync_token
 
             for obj in collection:
-                # 被删除的对象：data 为 None，直接跳过
+                href = str(obj.url.canonical())
+
+                # 被删除的对象：data 为 None，从快照反查内容
                 if obj.data is None:
+                    cached_ics = self.snapshot.pop(href, None)
+                    changes.append(
+                        Change(
+                            href=href,
+                            kind=ChangeKind.DELETED,
+                            events=self._parse_ics(cached_ics) if cached_ics else [],
+                        )
+                    )
                     continue
 
-                ics_string = obj.get_icalendar_instance().to_ical().decode()
-                stream = CalendarStream.from_ics(ics_string)
-                for ical_calendar in stream.calendars:
-                    events.extend(ical_calendar.events)
-        return events
-    async def notify_events(self, events: list[Event]) -> None:
-        for event in events:
-            # 这里可以根据事件的时间、标题等信息，发送通知给用户
-            self.logger.info(f"即将发生的事件: {event.uid}，开始时间: {event.start}")
-            # 例如，可以调用 bot 的消息发送接口，发送到指定的频道或用户
-            # await self.bot.send_message(channel_id, f"即将发生的事件: {event.summary}，开始时间: {event.start_time}")
-            
+                # get_icalendar_instance() 直接给 icalendar.Calendar，
+                # 可以 walk("VEVENT") 拿到组件，不必再 to_ical() 序列化一遍。
+                cal = obj.get_icalendar_instance()
+                kind = ChangeKind.UPDATED if href in self.snapshot else ChangeKind.ADDED
+                # 快照存 iCal 文本，删除时反查用
+                self.snapshot[href] = cal.to_ical().decode()
+                changes.append(
+                    Change(href=href, kind=kind, events=self._vevents(cal))
+                )
+        return changes
+
+    async def notify_events(self, changes: list[Change]) -> None:
+        now = datetime.now().astimezone()
+        for change in changes:
+            for event in change.events:
+                dtstart = event.decoded("DTSTART")
+                if dtstart is None:
+                    continue
+                # 这里可以根据事件的时间、标题等信息，发送通知给用户
+                self.logger.info(f"即将发生的事件: {event.get('UID')}，开始时间: {dtstart}")
+                if dtstart >= now:
+                    pass
