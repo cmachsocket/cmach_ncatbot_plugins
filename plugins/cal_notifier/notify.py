@@ -1,5 +1,7 @@
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 from enum import Enum
+from zoneinfo import ZoneInfo
 
 from ncatbot.plugin import NcatBotPlugin
 from caldav import aio
@@ -10,7 +12,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.jobstores.base import JobLookupError
-from datetime import date, datetime, time, timedelta
 from caldav import SynchronizableCalendarObjectCollection
 
 import recurring_ical_events
@@ -22,9 +23,17 @@ NOTIFY_JOB_PREFIX = "caldav_notify:"
 #: CalDAV 轮询周期（分钟）
 POLL_INTERVAL_MINUTES = 30
 
-#: 全天事件的提醒时刻：前一天的这个时间点
-ALL_DAY_NOTIFY_HOUR = 23
-ALL_DAY_NOTIFY_MINUTE = 30
+#: 强制全量同步的周期（小时）。滚动窗口靠它推进，必须远小于 notify_window_days，
+#: 否则窗口边缘的实例来不及被排上。
+FULL_SYNC_INTERVAL_HOURS = 12
+
+#: 全天事件的默认提醒时刻：前一天的这个时间点
+DEFAULT_ALL_DAY_NOTIFY_HOUR = 23
+DEFAULT_ALL_DAY_NOTIFY_MINUTE = 30
+
+#: 缺少时区信息的事件（尤其全天事件）按这个时区解释
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+
 
 class ChangeKind(Enum):
     ADDED = "added"
@@ -34,7 +43,7 @@ class ChangeKind(Enum):
 
 @dataclass
 class Change:
-    uid: str 
+    uid: str
     href: str
     kind: ChangeKind
     # 完整 VCALENDAR：展开重复事件必须带上主事件 + 覆盖实例，不能拆开。
@@ -46,20 +55,35 @@ class NotifyPlugin(NcatBotPlugin):
     caldav_user: str
     caldav_password: str
     davclient: "aio.AsyncDAVClient"
+    scheduler: AsyncIOScheduler
     sync_tokens: dict[str, str]   # {calendar_url: sync_token}
     snapshot: dict[str, str]      # {对象绝对URL: uid}
     target_id: int
     notify_before_minutes: int
     notify_window_days: int
+    all_day_notify_hour: int
+    all_day_notify_minute: int
+    tz: ZoneInfo
+    _jobs_by_uid: dict[str, set[str]]
+    _last_full_sync: datetime
 
     async def on_load(self) -> None:
         self.caldav_url = self.config.get("CALDAV_URL", "https://caldav.icloud.com/")
         self.caldav_user = self.config.get("CALDAV_USER", "your_username")
         self.caldav_password = self.config.get("CALDAV_PASSWORD", "your_password")
         self.target_id = int(self.config.get("target_id", 0))
-        self.notify_before_minutes = int(self.config.get("notify_before_minutes", 10))
-        self.notify_window_days = int(self.config.get("notify_window_days", 30))
-        self._jobs_by_uid: dict[str, set[str]] = {}
+        self.notify_before_minutes = max(0, int(self.config.get("notify_before_minutes", 10)))
+        self.notify_window_days = max(1, int(self.config.get("notify_window_days", 30)))
+        self.all_day_notify_hour = int(
+            self.config.get("all_day_notify_hour", DEFAULT_ALL_DAY_NOTIFY_HOUR)
+        )
+        self.all_day_notify_minute = int(
+            self.config.get("all_day_notify_minute", DEFAULT_ALL_DAY_NOTIFY_MINUTE)
+        )
+        self.tz = self._resolve_timezone(str(self.config.get("timezone", DEFAULT_TIMEZONE)))
+        self._jobs_by_uid = {}
+        # 启动后首轮就是全量（sync_tokens 为空），从加载时刻起算全量周期
+        self._last_full_sync = datetime.now(self.tz)
 
         if self.target_id == 0:
             self.logger.error("未配置 target_id，日程提醒将无法发送")
@@ -73,7 +97,7 @@ class NotifyPlugin(NcatBotPlugin):
         self.snapshot = {}
 
         self.scheduler = AsyncIOScheduler(
-            timezone="Asia/Shanghai",
+            timezone=self.tz,
             jobstores=self._build_jobstores(),
             job_defaults={
                 'coalesce': True,          # 合并错过的运行
@@ -85,20 +109,30 @@ class NotifyPlugin(NcatBotPlugin):
             trigger=IntervalTrigger(minutes=POLL_INTERVAL_MINUTES),
             id="caldav_poll",
             replace_existing=True,
+            # 立即跑第一轮：否则启动后 30 分钟内一条提醒都排不上，
+            # 而错过的提醒点又不补发，重启等于白等半个钟头。
+            next_run_time=datetime.now(self.tz),
         )
         self.scheduler.start()
         self.logger.info(
             f"{self.name} 已加载，提前 {self.notify_before_minutes} 分钟提醒"
         )
 
+    def _resolve_timezone(self, name: str) -> ZoneInfo:
+        try:
+            return ZoneInfo(name)
+        except (KeyError, ValueError):
+            self.logger.warning(f"时区 {name} 不可用，回退到 {DEFAULT_TIMEZONE}")
+            return ZoneInfo(DEFAULT_TIMEZONE)
+
     def _build_jobstores(self) -> dict:
         """只用内存作业存储。
 
         不用持久化 jobstore 的原因：轮询本身就是恢复机制——插件重启后
         sync_tokens 为空，下一轮是全量同步，所有事件重报 ADDED 并重排作业，
-        30 分钟内自动恢复。而持久化会让 APScheduler pickle 整个作业
-        （apscheduler/job.py:277 把 self 一起塞进 args），而 ncatbot 注入的
-        self.api / self.services 等持有 websocket、事件循环，不可 pickle。
+        下一轮轮询内自动恢复。而持久化会让 APScheduler 序列化整个作业：
+        绑定方法会把 self 一起写进 args，而 NcatBot 注入的 self.api 等
+        持有 websocket、事件循环，不可序列化。
         """
         return {"default": MemoryJobStore()}
 
@@ -111,7 +145,6 @@ class NotifyPlugin(NcatBotPlugin):
 
     # ---------- CalDAV 同步 ----------
 
-
     async def get_calendar_events(self) -> list[Change]:
         principal = await self.davclient.get_principal()
         calendars = await self.davclient.get_calendars(principal)
@@ -120,26 +153,27 @@ class NotifyPlugin(NcatBotPlugin):
         for calendar in calendars:
             cal_url = str(calendar.url)
             old_token = self.sync_tokens.get(cal_url)
-            collection : SynchronizableCalendarObjectCollection | None = None
-            # 在 calendar 上调，返回的是集合，不是元组。
-            # 公开的 get_objects_by_sync_token() 返回 list | Coroutine 联合类型，
-            # Pyright 无法判定要不要 await；这里直接用内部那个真正 async 的实现。
-            try:
-                collection = await calendar._async_get_objects_by_sync_token(
+            # 私有 API：公开的 get_objects_by_sync_token() 返回 list | Coroutine
+            # 联合类型，Pyright 无法判定要不要 await。先探测属性存在再调用，
+            # 免得 except AttributeError 把库内部的同名异常一起吞掉。
+            if not hasattr(calendar, "_async_get_objects_by_sync_token"):
+                self.logger.error("不存在_async_get_objects_by_sync_token(),检查库实现")
+                continue
+            collection: SynchronizableCalendarObjectCollection = (
+                await calendar._async_get_objects_by_sync_token(
                     sync_token=old_token,
                     load_objects=True,       # 需要完整 iCal 数据
                 )
-            except AttributeError:
-                self.logger.error("不存在_async_get_objects_by_sync_token(),检查库实现")
-            if collection is None:
-                continue
+            )
             # 保存新 token（首次调用 old_token=None，会全量返回并给初始 token）
             self.sync_tokens[cal_url] = collection.sync_token
+            seen: set[str] = set()
 
             for obj in collection:
                 href = str(obj.url.canonical())
+                seen.add(href)
 
-                #  快照存 {href: uid}，删除时用于反查需要取消的作业
+                # 快照存 {href: uid}，删除时用于反查需要取消的作业
                 if obj.data is None:
                     changes.append(
                         Change(href=href, kind=ChangeKind.DELETED,
@@ -147,9 +181,8 @@ class NotifyPlugin(NcatBotPlugin):
                     )
                     continue
 
-                # get_icalendar_instance() 直接给 icalendar.Calendar，
-                # 可以 walk("VEVENT") 拿到组件，不必再 to_ical() 序列化一遍。
-                # 返回类型声明可空，显式收窄，避免下游 to_ical()/_vevents() 报 Optional。
+                # get_icalendar_instance() 直接给 icalendar.Calendar。
+                # 返回类型声明可空，显式收窄，避免下游访问报 Optional。
                 cal = obj.get_icalendar_instance()
                 if not isinstance(cal, Calendar):
                     continue
@@ -157,8 +190,20 @@ class NotifyPlugin(NcatBotPlugin):
                 uid = str(obj.icalendar_component.get("UID") or "")
                 self.snapshot[href] = uid
                 changes.append(
-                    Change(href=href, kind=kind, calendar=cal,uid=uid)
+                    Change(href=href, kind=kind, calendar=cal, uid=uid)
                 )
+
+            # 全量同步不返回删除条目：拿"本次拉到的集合"和快照对账，
+            # 否则上一轮之后被删掉的事件会带着已排的作业一直留着。
+            # 对象 URL 是日历 URL 的子路径，按前缀归属。
+            if old_token is None and cal_url:
+                for href in [h for h in self.snapshot if h.startswith(cal_url)]:
+                    if href in seen:
+                        continue
+                    changes.append(
+                        Change(href=href, kind=ChangeKind.DELETED,
+                            uid=self.snapshot.pop(href, ""))
+                    )
         return changes
 
     # ---------- 通知调度 ----------
@@ -171,6 +216,9 @@ class NotifyPlugin(NcatBotPlugin):
             except JobLookupError:
                 pass
 
+    def _forget_job(self, uid: str, job_id: str) -> None:
+        """作业是一次性的：触发后 APScheduler 会删掉它，索引也得同步摘掉。"""
+        self._jobs_by_uid.get(uid, set()).discard(job_id)
 
     def _schedule_occurrence(self, occ: ICalEvent, now: datetime) -> None:
         # 被取消的实例直接跳过
@@ -188,18 +236,18 @@ class NotifyPlugin(NcatBotPlugin):
             # 定时事件：提前 notify_before_minutes 分钟提醒
             start = raw
             if start.tzinfo is None:
-                start = start.replace(tzinfo=now.tzinfo)
+                start = start.replace(tzinfo=self.tz)
             if start <= now:
                 return                      # 已经开始了，不补发
             notify_at = start - timedelta(minutes=self.notify_before_minutes)
             all_day = False
         elif isinstance(raw, date):
-            # 全天事件：前一天 23:30 提醒
+            # 全天事件：前一天 all_day_notify_hour:minute 提醒
             if raw < now.date():
                 return                      # 已经过去了，不补发
-            start = datetime.combine(raw, time.min, tzinfo=now.tzinfo)
+            start = datetime.combine(raw, time.min, tzinfo=self.tz)
             notify_at = (start - timedelta(days=1)).replace(
-                hour=ALL_DAY_NOTIFY_HOUR, minute=ALL_DAY_NOTIFY_MINUTE
+                hour=self.all_day_notify_hour, minute=self.all_day_notify_minute
             )
             all_day = True
         else:
@@ -217,17 +265,19 @@ class NotifyPlugin(NcatBotPlugin):
         anchor = rid.dt if rid is not None else raw
         job_id = f"{NOTIFY_JOB_PREFIX}{uid}:{anchor.isoformat()}"
 
+        # 时间在这里就格式化好：作业参数不用再扛 ISO 串给运行时反解
+        when = f"{start:%Y-%m-%d} 全天" if all_day else f"{start:%Y-%m-%d %H:%M}"
         self.scheduler.add_job(
             self.send_notification,
             trigger=DateTrigger(run_date=notify_at),
-            args=[str(occ.get("SUMMARY") or "(无标题)"), start.isoformat(), all_day],
+            args=[str(occ.get("SUMMARY") or "(无标题)"), when, uid, job_id],
             id=job_id,
             replace_existing=True,
         )
         self._jobs_by_uid.setdefault(uid, set()).add(job_id)
 
     async def notify_events(self, changes: list[Change]) -> None:
-        now = datetime.now().astimezone()
+        now = datetime.now(self.tz)
         horizon = now + timedelta(days=self.notify_window_days)
 
         for change in changes:
@@ -252,22 +302,29 @@ class NotifyPlugin(NcatBotPlugin):
                 self._schedule_occurrence(occ, now)
 
     async def send_notification(
-        self, summary: str, start_iso: str, all_day: bool = False
+        self, summary: str, when: str, uid: str, job_id: str
     ) -> None:
-        if self.target_id == 0:
-            self.logger.error("未配置 target_id，无法发送日程提醒")
-            return
         try:
-            start = datetime.fromisoformat(start_iso)
-            when = f"{start:%Y-%m-%d} 全天" if all_day else f"{start:%Y-%m-%d %H:%M}"
-        except ValueError:
-            when = start_iso
-        text = f"日程提醒：{summary}\n开始时间：{when}"
-        await self.api.qq.post_private_msg(self.target_id, text=text)
-        self.logger.info(f"已发送日程提醒：{summary} @ {when}")
+            if self.target_id == 0:
+                self.logger.error("未配置 target_id，无法发送日程提醒")
+                return
+            text = f"日程提醒：{summary}\n开始时间：{when}"
+            await self.api.qq.post_private_msg(self.target_id, text=text)
+            self.logger.info(f"已发送日程提醒：{summary} @ {when}")
+        finally:
+            self._forget_job(uid, job_id)
 
     async def poll_once(self) -> None:
         """定时入口：拉取变更并重排通知作业。"""
+        now = datetime.now(self.tz)
+        if now - self._last_full_sync >= timedelta(hours=FULL_SYNC_INTERVAL_HOURS):
+            # 带 token 的 REPORT 只返回变更过的对象，纯重复事件不会被重新展开，
+            # 于是"原本在窗口外、后来滚进窗口"的实例永远排不上提醒——提醒会在
+            # 事件最后一次被编辑后 notify_window_days 天左右静默冻结。
+            # 丢掉 token 强制全量，把窗口重新填满，顺带自愈任何状态漂移。
+            self.logger.info("到达全量同步周期，丢弃 sync token 重新全量拉取")
+            self.sync_tokens.clear()
+            self._last_full_sync = now
         try:
             changes = await self.get_calendar_events()
         except Exception as exc:
