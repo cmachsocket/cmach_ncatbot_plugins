@@ -1,9 +1,9 @@
-name = "cmach.top.send.rss.summary"
+name = "cmach.top.cal.notifier"
 version = "0.1.0"
 main = "notify.py"
 author = "cmach_socket"
 description = "Send rss summaries"
-entry_class = "RssSender"
+entry_class = "NotifyPlugin"
 pip_dependencies = []
 
 [dependencies]
