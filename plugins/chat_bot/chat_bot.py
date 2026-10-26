@@ -88,9 +88,11 @@ async def send_message_tool(
         # 没注入到就说明 state 没带上，后面只用 plugin，直接早退更清楚
         LOG.error("send_message_tool 未拿到 plugin，state 可能缺少 plugin 字段")
         return "error: missing plugin"
-
-    if not reply or not content.strip():
+    if not reply:
         LOG.info("模型选择不回复")
+    elif not content.strip():
+        LOG.info("回复内容为空")
+    if not reply or not content.strip():
         plugin.add_context(
             bot_content="", message=user_msg, user_content=user_content
         )
