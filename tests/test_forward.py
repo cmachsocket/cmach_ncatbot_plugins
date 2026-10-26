@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ncatbot.types import MessageArray, PlainText
+from ncatbot.types import MessageArray, PlainText, parse_segment
 from ncatbot.types.qq import Forward, ForwardNode
 
 from plugins.chat_bot.chat_bot import (
@@ -36,7 +36,7 @@ def _node(
     return ForwardNode(
         user_id=uid,
         nickname=name,
-        content=list(segments),
+        content=[parse_segment(seg) for seg in segments],
     )
 
 
