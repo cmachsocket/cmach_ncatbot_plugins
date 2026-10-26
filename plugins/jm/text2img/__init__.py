@@ -6,13 +6,20 @@ Quick start::
 
     render("你好世界\\nHello World\\nこんにちは", theme="dark", out="out.png")
 """
+
 from .engine import render
-from .fonts import FontSet, detect_fontset, describe, wrap, measure
+from .fonts import FontSet, describe, detect_fontset, measure, wrap
 from .styles import Style, get_style, list_styles
 
 __all__ = [
-    "render", "FontSet", "Style",
-    "detect_fontset", "describe", "wrap", "measure",
-    "get_style", "list_styles",
+    "FontSet",
+    "Style",
+    "describe",
+    "detect_fontset",
+    "get_style",
+    "list_styles",
+    "measure",
+    "render",
+    "wrap",
 ]
 __version__ = "0.1.0"

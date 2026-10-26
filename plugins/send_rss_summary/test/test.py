@@ -16,7 +16,7 @@ import ncatbot.core  # noqa: F401
 # 改为把插件目录加进 sys.path 后按普通模块导入。
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from rss import RssSender  # noqa: E402
+from rss import RssSender
 
 
 async def test_send_rss_summary():

@@ -11,11 +11,11 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-from typing import Any, Dict, List
+from typing import Any
 
-from ncatbot.plugin import NcatBotPlugin
 from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
+from ncatbot.plugin import NcatBotPlugin
 from ncatbot.types import MessageArray, PlainText
 
 # ============== System Prompt（所有规则集中在这）==============
@@ -32,7 +32,7 @@ SYSTEM_PROMPT = """你是班级小助手，负责审核源群消息。
 
 
 # ============== Tools Schema（暴露给 LLM 的工具定义）==============
-TOOLS_SCHEMA: List[Dict[str, Any]] = [
+TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -159,7 +159,7 @@ class HelperPlugin(NcatBotPlugin):
                     f"转发失败：{e!r}\n原消息：{event.raw_message[:50]}"
                 )
 
-        async def do_add_timer(args: Dict[str, Any]) -> None:
+        async def do_add_timer(args: dict[str, Any]) -> None:
             # 先校验参数（这一步错通常是 LLM 给的字段不对）
             try:
                 t = datetime.datetime(

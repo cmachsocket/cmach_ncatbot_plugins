@@ -12,6 +12,7 @@ Termux 上需要的字体包（提前装好）::
     pkg install noto-fonts-emoji  # Noto Color Emoji（黑白，但能识别）
     pkg install fontconfig-utils   # 提供 fc-list（可选，没装也能 glob 兜底）
 """
+
 from __future__ import annotations
 
 import glob
@@ -20,10 +21,8 @@ import re
 import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional
 
 from PIL import ImageFont
-
 
 # ---------------------------------------------------------------------------
 # Unicode 脚本分类
@@ -32,48 +31,48 @@ from PIL import ImageFont
 # 顺序很关键：先查小范围（如日文假名），再查大范围（CJK 统一表意）
 UNICODE_RANGES: tuple[tuple[str, int, int], ...] = (
     # 表情符号
-    ("emoji",       0x1F300, 0x1FAFF),  # emoji 大类
-    ("emoji_misc",  0x2600, 0x27BF),    # 杂项符号（含 ⚡ ★ 等）
-    ("emoji_misc",  0x2300, 0x23FF),    # 杂类技术符号
+    ("emoji", 0x1F300, 0x1FAFF),  # emoji 大类
+    ("emoji_misc", 0x2600, 0x27BF),  # 杂项符号（含 ⚡ ★ 等）
+    ("emoji_misc", 0x2300, 0x23FF),  # 杂类技术符号
     # 日文假名（要在 CJK 之前匹配，否则会被当成 CJK）
-    ("cjk_jp",      0x3040, 0x309F),    # 平假名
-    ("cjk_jp",      0x30A0, 0x30FF),    # 片假名
-    ("cjk_jp",      0x31F0, 0x31FF),    # 片假名语音扩展
+    ("cjk_jp", 0x3040, 0x309F),  # 平假名
+    ("cjk_jp", 0x30A0, 0x30FF),  # 片假名
+    ("cjk_jp", 0x31F0, 0x31FF),  # 片假名语音扩展
     # 韩文
-    ("cjk_kr",      0xAC00, 0xD7AF),    # 谚文音节
-    ("cjk_kr",      0x1100, 0x11FF),    # 谚文字母
-    ("cjk_kr",      0x3130, 0x318F),    # 谚文兼容字母
+    ("cjk_kr", 0xAC00, 0xD7AF),  # 谚文音节
+    ("cjk_kr", 0x1100, 0x11FF),  # 谚文字母
+    ("cjk_kr", 0x3130, 0x318F),  # 谚文兼容字母
     # CJK 统一表意（中文为主，但日韩也用）
-    ("cjk",         0x4E00, 0x9FFF),
-    ("cjk",         0x3400, 0x4DBF),    # 扩展 A
-    ("cjk",         0x20000, 0x2A6DF),  # 扩展 B（用 surrogate pair）
-    ("cjk",         0x2A700, 0x2EBEF),  # 扩展 C-F
-    ("cjk",         0xF900, 0xFAFF),    # 兼容表意
+    ("cjk", 0x4E00, 0x9FFF),
+    ("cjk", 0x3400, 0x4DBF),  # 扩展 A
+    ("cjk", 0x20000, 0x2A6DF),  # 扩展 B（用 surrogate pair）
+    ("cjk", 0x2A700, 0x2EBEF),  # 扩展 C-F
+    ("cjk", 0xF900, 0xFAFF),  # 兼容表意
     # CJK 标点 / 全角
-    ("cjk_punct",   0x3000, 0x303F),
-    ("cjk_punct",   0xFF00, 0xFFEF),
+    ("cjk_punct", 0x3000, 0x303F),
+    ("cjk_punct", 0xFF00, 0xFFEF),
     # 阿拉伯文
-    ("arabic",      0x0600, 0x06FF),
-    ("arabic",      0x0750, 0x077F),
-    ("arabic",      0xFB50, 0xFDFF),
-    ("arabic",      0xFE70, 0xFEFF),
+    ("arabic", 0x0600, 0x06FF),
+    ("arabic", 0x0750, 0x077F),
+    ("arabic", 0xFB50, 0xFDFF),
+    ("arabic", 0xFE70, 0xFEFF),
     # 希伯来文
-    ("hebrew",      0x0590, 0x05FF),
+    ("hebrew", 0x0590, 0x05FF),
     # 泰文
-    ("thai",        0x0E00, 0x0E7F),
+    ("thai", 0x0E00, 0x0E7F),
     # 天城文（印地语等）
-    ("devanagari",  0x0900, 0x097F),
+    ("devanagari", 0x0900, 0x097F),
     # 西里尔
-    ("cyrillic",    0x0400, 0x04FF),
-    ("cyrillic",    0x0500, 0x052F),
+    ("cyrillic", 0x0400, 0x04FF),
+    ("cyrillic", 0x0500, 0x052F),
     # 希腊
-    ("greek",       0x0370, 0x03FF),
+    ("greek", 0x0370, 0x03FF),
     # 拉丁扩展（含越南文声调）
-    ("latin_ext",   0x0100, 0x024F),
-    ("latin_ext",   0x1E00, 0x1EFF),
-    ("latin_ext",   0x1EA0, 0x1EF9),
+    ("latin_ext", 0x0100, 0x024F),
+    ("latin_ext", 0x1E00, 0x1EFF),
+    ("latin_ext", 0x1EA0, 0x1EF9),
     # 拉丁基本
-    ("latin",       0x0020, 0x007E),
+    ("latin", 0x0020, 0x007E),
 )
 
 
@@ -95,9 +94,11 @@ def char_script(ch: str) -> str:
 # 字体集合
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class FontSet:
     """一套字体，按 Unicode 脚本分类。空字符串表示未找到（自动降级）。"""
+
     sans: str = ""
     serif: str = ""
     mono: str = ""
@@ -138,6 +139,7 @@ class FontSet:
 # 探测
 # ---------------------------------------------------------------------------
 
+
 def _fc_list(query: str) -> list[str]:
     """``fc-list :lang=zh file`` 风格的字体路径探测。失败返回空列表。"""
     try:
@@ -152,8 +154,12 @@ def _fc_list(query: str) -> list[str]:
             if ":" in line:
                 paths.append(line.split(":")[0].strip())
         return paths
-    except (subprocess.CalledProcessError, FileNotFoundError,
-            subprocess.TimeoutExpired, PermissionError):
+    except (
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+        subprocess.TimeoutExpired,
+        PermissionError,
+    ):
         return []
 
 
@@ -174,12 +180,15 @@ def _glob_system_fonts() -> list[str]:
     for root in roots:
         if os.path.isdir(root):
             for ext in ("ttf", "otf", "ttc"):
-                candidates.extend(glob.glob(os.path.join(root, f"**/*.{ext}"),
-                                            recursive=True))
+                candidates.extend(
+                    glob.glob(os.path.join(root, f"**/*.{ext}"), recursive=True)
+                )
     return candidates
 
 
-def _pick_first(paths: list[str], keywords: list[str], fallback_to_first: bool = False) -> Optional[str]:
+def _pick_first(
+    paths: list[str], keywords: list[str], fallback_to_first: bool = False
+) -> str | None:
     """从路径列表里按关键词优先级挑一个。
 
     Parameters
@@ -210,9 +219,17 @@ def _pick_first(paths: list[str], keywords: list[str], fallback_to_first: bool =
 def _classify(paths: list[str]) -> dict[str, list[str]]:
     """把字体路径按家族分类。"""
     classes: dict[str, list[str]] = {
-        "cjk": [], "cjk_sc": [], "cjk_jp": [], "cjk_kr": [],
-        "sans": [], "serif": [], "mono": [],
-        "arabic": [], "hebrew": [], "thai": [], "cyrillic": [],
+        "cjk": [],
+        "cjk_sc": [],
+        "cjk_jp": [],
+        "cjk_kr": [],
+        "sans": [],
+        "serif": [],
+        "mono": [],
+        "arabic": [],
+        "hebrew": [],
+        "thai": [],
+        "cyrillic": [],
         "emoji": [],
     }
     for p in paths:
@@ -221,8 +238,19 @@ def _classify(paths: list[str]) -> dict[str, list[str]]:
         if "emoji" in name:
             classes["emoji"].append(p)
             continue
-        if any(kw in name for kw in ("cjk", "sourcehan", "pingfang", "yahei", "simsun",
-                                     "songti", "wenquanyi", "notosanscjk")):
+        if any(
+            kw in name
+            for kw in (
+                "cjk",
+                "sourcehan",
+                "pingfang",
+                "yahei",
+                "simsun",
+                "songti",
+                "wenquanyi",
+                "notosanscjk",
+            )
+        ):
             classes["cjk"].append(p)
             if any(kw in name for kw in ("sc", "cn", "chs")):
                 classes["cjk_sc"].append(p)
@@ -293,9 +321,19 @@ def detect_fontset() -> FontSet:
 
     # 4) 填充 FontSet
     fs.cjk = (
-        _pick_first(classes["cjk"], ["NotoSansCJK-Regular", "NotoSansCJK",
-                                     "WenQuanYi", "SourceHan", "DroidSansFallback"])
-        or _pick_first(classes["cjk"], [], fallback_to_first=True)  # 实在没有 → 取任意一个 cjk 类的
+        _pick_first(
+            classes["cjk"],
+            [
+                "NotoSansCJK-Regular",
+                "NotoSansCJK",
+                "WenQuanYi",
+                "SourceHan",
+                "DroidSansFallback",
+            ],
+        )
+        or _pick_first(
+            classes["cjk"], [], fallback_to_first=True
+        )  # 实在没有 → 取任意一个 cjk 类的
     )
     fs.cjk_sc = (
         _pick_first(classes["cjk_sc"], ["SC", "CN", "NotoSansCJK", "SourceHanSansCN"])
@@ -314,14 +352,18 @@ def detect_fontset() -> FontSet:
     )
     fs.sans = (
         _pick_first(classes["sans"], ["NotoSans-Regular", "NotoSans", "DejaVuSans"])
-        or fs.cjk_sc or fs.cjk
+        or fs.cjk_sc
+        or fs.cjk
     )
     fs.serif = (
         _pick_first(classes["serif"], ["NotoSerif-Regular", "NotoSerif", "DejaVuSerif"])
         or fs.sans
     )
     fs.mono = (
-        _pick_first(classes["mono"], ["JetBrainsMapleMono", "JetBrainsMono", "DejaVuSansMono", "DroidSansMono"])
+        _pick_first(
+            classes["mono"],
+            ["JetBrainsMapleMono", "JetBrainsMono", "DejaVuSansMono", "DroidSansMono"],
+        )
         or fs.sans
     )
     fs.arabic = _pick_first(classes["arabic"], ["NotoSansArabic", "Arabic"]) or fs.sans
@@ -341,6 +383,7 @@ def cached_fontset() -> FontSet:
 # ---------------------------------------------------------------------------
 # 加载
 # ---------------------------------------------------------------------------
+
 
 @lru_cache(maxsize=128)
 def _load(path: str, size: int) -> ImageFont.FreeTypeFont:
@@ -389,10 +432,10 @@ def font_for_char(ch: str, fs: FontSet, size: int) -> ImageFont.FreeTypeFont:
 # ---------------------------------------------------------------------------
 
 _TOKEN_RE = re.compile(
-    r"[A-Za-z0-9_]+"           # ASCII 单词
-    r"|\s"                     # 空白
+    r"[A-Za-z0-9_]+"  # ASCII 单词
+    r"|\s"  # 空白
     r"|[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]"  # 单个 CJK 字符
-    r"|."                      # 其他单个字符
+    r"|."  # 其他单个字符
 )
 
 
@@ -402,7 +445,7 @@ def measure(text: str, fs: FontSet, size: int) -> int:
     for ch in text:
         f = font_for_char(ch, fs, size)
         w += f.getlength(ch)
-    return int(round(w))
+    return round(w)
 
 
 def wrap(text: str, fs: FontSet, size: int, max_width: int) -> list[str]:
@@ -458,6 +501,7 @@ def wrap(text: str, fs: FontSet, size: int, max_width: int) -> list[str]:
 # ---------------------------------------------------------------------------
 # 调试
 # ---------------------------------------------------------------------------
+
 
 def describe(fs: FontSet) -> str:
     """格式化输出 FontSet 探测结果，方便调试。"""

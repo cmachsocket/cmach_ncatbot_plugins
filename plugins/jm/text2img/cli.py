@@ -1,4 +1,5 @@
 """``text2png`` 命令行入口（text2img 的 CLI）。"""
+
 from __future__ import annotations
 
 import argparse
@@ -29,21 +30,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("text", nargs="?", help="直接给的文本（也可用 -f 或 stdin）")
     parser.add_argument("-f", "--file", help="从文件读取（- 表示 stdin）")
     parser.add_argument("-o", "--out", required=False, help="输出 PNG 路径")
-    parser.add_argument("-t", "--theme", default="modern",
-                        choices=list_styles(),
-                        help="主题（默认 modern）")
-    parser.add_argument("-w", "--width", type=int, default=900,
-                        help="画布宽度 px（默认 900）")
-    parser.add_argument("--font-size", type=int, default=None,
-                        help="字号 px（覆盖主题）")
-    parser.add_argument("--line-height", type=float, default=None,
-                        help="行高倍数（覆盖主题）")
-    parser.add_argument("--scale", type=int, default=2,
-                        help="超采样倍率，默认 2")
-    parser.add_argument("--list-themes", action="store_true",
-                        help="列出所有可用主题")
-    parser.add_argument("--show-fonts", action="store_true",
-                        help="打印探测到的字体")
+    parser.add_argument(
+        "-t",
+        "--theme",
+        default="modern",
+        choices=list_styles(),
+        help="主题（默认 modern）",
+    )
+    parser.add_argument(
+        "-w", "--width", type=int, default=900, help="画布宽度 px（默认 900）"
+    )
+    parser.add_argument(
+        "--font-size", type=int, default=None, help="字号 px（覆盖主题）"
+    )
+    parser.add_argument(
+        "--line-height", type=float, default=None, help="行高倍数（覆盖主题）"
+    )
+    parser.add_argument("--scale", type=int, default=2, help="超采样倍率，默认 2")
+    parser.add_argument("--list-themes", action="store_true", help="列出所有可用主题")
+    parser.add_argument("--show-fonts", action="store_true", help="打印探测到的字体")
     args = parser.parse_args(argv)
 
     if args.list_themes:
@@ -55,7 +60,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if not args.out:
-        print("错误：需要 -o/--out，或者使用 --list-themes / --show-fonts。", file=sys.stderr)
+        print(
+            "错误：需要 -o/--out，或者使用 --list-themes / --show-fonts。",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     text = _read_text(args)

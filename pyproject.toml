@@ -15,3 +15,6 @@ dependencies = [
     "hindsight_client",
     "apscheduler",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

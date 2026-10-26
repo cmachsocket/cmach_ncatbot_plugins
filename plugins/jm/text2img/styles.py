@@ -1,10 +1,10 @@
 """预设主题（和 text2png 风格一致）。"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from typing import Tuple
+from dataclasses import dataclass, replace
 
-Color = Tuple[int, int, int] | Tuple[int, int, int, int]
+Color = tuple[int, int, int] | tuple[int, int, int, int]
 
 
 @dataclass
@@ -24,7 +24,7 @@ class Style:
     padding_x: int = 72
     padding_y: int = 80
 
-    title_font: str = "serif"   # 文本样式对应字体角色（"serif"/"sans"/"mono"）
+    title_font: str = "serif"  # 文本样式对应字体角色（"serif"/"sans"/"mono"）
     body_font: str = "serif"
     mono_font: str = "mono"
 
@@ -39,7 +39,8 @@ THEMES: dict[str, Style] = {
         muted=(150, 150, 150),
         accent=(26, 26, 26),
         rule=(225, 225, 225),
-        font_size=28, line_height=1.75,
+        font_size=28,
+        line_height=1.75,
         body_font="sans",
     ),
     "literary": Style(
@@ -49,10 +50,12 @@ THEMES: dict[str, Style] = {
         muted=(124, 112, 102),
         accent=(124, 60, 30),
         rule=(200, 190, 175),
-        font_size=28, line_height=1.85,
+        font_size=28,
+        line_height=1.85,
         letter_spacing=0.2,
         show_rule=True,
-        body_font="serif", title_font="serif",
+        body_font="serif",
+        title_font="serif",
     ),
     "dark": Style(
         name="dark",
@@ -61,7 +64,8 @@ THEMES: dict[str, Style] = {
         muted=(140, 156, 180),
         accent=(100, 200, 255),
         rule=(50, 60, 80),
-        font_size=28, line_height=1.75,
+        font_size=28,
+        line_height=1.75,
         body_font="sans",
     ),
     "paper": Style(
@@ -71,7 +75,8 @@ THEMES: dict[str, Style] = {
         muted=(150, 120, 95),
         accent=(170, 70, 40),
         rule=(210, 180, 150),
-        font_size=28, line_height=1.85,
+        font_size=28,
+        line_height=1.85,
         letter_spacing=0.1,
         body_font="serif",
     ),
@@ -82,8 +87,10 @@ THEMES: dict[str, Style] = {
         muted=(130, 110, 70),
         accent=(220, 80, 60),
         rule=(220, 195, 120),
-        font_size=30, line_height=1.7,
-        padding_x=64, padding_y=72,
+        font_size=30,
+        line_height=1.7,
+        padding_x=64,
+        padding_y=72,
         body_font="sans",
     ),
     "terminal": Style(
@@ -93,8 +100,10 @@ THEMES: dict[str, Style] = {
         muted=(122, 138, 106),
         accent=(255, 175, 95),
         rule=(42, 46, 38),
-        font_size=22, line_height=1.55,
-        body_font="mono", title_font="mono",
+        font_size=22,
+        line_height=1.55,
+        body_font="mono",
+        title_font="mono",
     ),
     "ocean": Style(
         name="ocean",
@@ -103,7 +112,8 @@ THEMES: dict[str, Style] = {
         muted=(186, 230, 253),
         accent=(253, 230, 138),
         rule=(255, 255, 255, 50),
-        font_size=28, line_height=1.85,
+        font_size=28,
+        line_height=1.85,
         body_font="serif",
     ),
 }

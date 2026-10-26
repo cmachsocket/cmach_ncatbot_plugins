@@ -7,21 +7,21 @@
 - 画布高度根据内容自适应
 - 可选 2x 超采样保证清晰度
 """
+
 from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable, Sequence
 
 from PIL import Image, ImageDraw
 
-from .fonts import FontSet, cached_fontset, font_for_char, measure, wrap
+from .fonts import FontSet, cached_fontset, font_for_char, wrap
 from .styles import Style, get_style
-
 
 # ---------------------------------------------------------------------------
 # 渐变背景
 # ---------------------------------------------------------------------------
+
 
 def _vertical_gradient(size: tuple[int, int], top: tuple, bottom: tuple) -> Image.Image:
     """线性垂直渐变。``size = (width, height)``。"""
@@ -45,6 +45,7 @@ def _vertical_gradient(size: tuple[int, int], top: tuple, bottom: tuple) -> Imag
 # 渲染
 # ---------------------------------------------------------------------------
 
+
 def _draw_run(
     draw: ImageDraw.ImageDraw,
     x: int,
@@ -62,7 +63,7 @@ def _draw_run(
         if ch == "\n":
             if run and prev_font is not None:
                 draw.text((cur_x, y), run, font=prev_font, fill=color)
-                cur_x += int(round(prev_font.getlength(run)))
+                cur_x += round(prev_font.getlength(run))
             run = ""
             prev_font = None
             cur_x = x
@@ -74,17 +75,16 @@ def _draw_run(
         else:
             if run and prev_font is not None:
                 draw.text((cur_x, y), run, font=prev_font, fill=color)
-                cur_x += int(round(prev_font.getlength(run)))
+                cur_x += round(prev_font.getlength(run))
             run = ch
             prev_font = f
     if run and prev_font is not None:
         draw.text((cur_x, y), run, font=prev_font, fill=color)
-        cur_x += int(round(prev_font.getlength(run)))
+        cur_x += round(prev_font.getlength(run))
     return cur_x, y
 
 
-def _text_block_height(text: str, fs: FontSet, style: Style,
-                       text_width: int) -> int:
+def _text_block_height(text: str, fs: FontSet, style: Style, text_width: int) -> int:
     """计算一段文本渲染后的高度（行数 * 行高）。"""
     lines = wrap(text, fs, style.font_size, text_width)
     line_h = int(style.font_size * style.line_height)
@@ -184,9 +184,9 @@ def render(
         rule_y = text_y + text_h + line_h // 4
         rule_color = style.rule if len(style.rule) == 4 else style.rule + (200,)
         draw.line(
-            [(style.padding_x, rule_y),
-             (width - style.padding_x, rule_y)],
-            fill=rule_color, width=2,
+            [(style.padding_x, rule_y), (width - style.padding_x, rule_y)],
+            fill=rule_color,
+            width=2,
         )
 
     # 7) 超采样放大
