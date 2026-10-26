@@ -14,6 +14,7 @@ from ncatbot.types import MessageArray, PlainText, parse_segment
 from ncatbot.types.qq import Forward, ForwardNode
 
 from plugins.chat_bot.chat_bot import (
+    _HISTORY_IMAGE_ROUNDS,
     _MAX_FORWARD_CHARS,
     _MAX_FORWARD_IMAGES,
     AIPlugin,
@@ -225,3 +226,62 @@ def test_fetch_forward_nodes_converts_messages_and_skips_unknown_segments() -> N
     assert nodes[0].user_id == "42"
     assert nodes[0].nickname == "Nick"
     assert [seg.text for seg in nodes[0].content] == ["hi"]
+
+
+def test_resolve_normal_image_keeps_text_placeholder() -> None:
+    message = MessageArray.from_list(
+        [{"type": "image", "data": {"file": "a.jpg", "url": "https://x"}}]
+    )
+
+    text, parts = _run(
+        AIPlugin.resolve_message_multimodal(cast(Any, _FakePlugin()), message)
+    )
+
+    assert text == "[图片] "
+    assert {"type": "text", "text": "[图片] "} in parts
+    assert {"type": "image_url", "image_url": {"url": "https://x"}} in parts
+
+
+def _image_round(index: int) -> list[dict[str, Any]]:
+    return [
+        {"type": "text", "text": f"u{index}: "},
+        {"type": "image_url", "image_url": {"url": f"https://x/{index}"}},
+    ]
+
+
+def _has_image_url(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(part, dict) and part.get("type") == "image_url" for part in content
+    )
+
+
+def test_history_keeps_images_for_recent_10_rounds() -> None:
+    plugin = object.__new__(AIPlugin)
+    plugin.assistent_messages = []
+
+    for i in range(_HISTORY_IMAGE_ROUNDS):
+        plugin.add_context(
+            bot_content="ok",
+            message=f"u{i}: ",
+            user_content=_image_round(i),
+        )
+
+    human_messages = [msg for msg in plugin.assistent_messages if msg.type == "human"]
+    assert len(human_messages) == _HISTORY_IMAGE_ROUNDS
+    assert all(_has_image_url(msg.content) for msg in human_messages)
+
+    plugin.add_context(
+        bot_content="ok",
+        message=f"u{_HISTORY_IMAGE_ROUNDS}: ",
+        user_content=_image_round(_HISTORY_IMAGE_ROUNDS),
+    )
+
+    human_messages = [msg for msg in plugin.assistent_messages if msg.type == "human"]
+    assert len(human_messages) == _HISTORY_IMAGE_ROUNDS + 1
+    assert not _has_image_url(human_messages[0].content)
+    first_content = human_messages[0].content
+    assert isinstance(first_content, list)
+    assert {"type": "text", "text": "u0: "} in first_content
+    assert all(_has_image_url(msg.content) for msg in human_messages[1:])

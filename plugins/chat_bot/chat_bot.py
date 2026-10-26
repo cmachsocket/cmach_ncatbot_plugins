@@ -53,12 +53,12 @@ LOG = get_log("AIPlugin")
 
 
 class ChatAgentState(AgentState):
-    """在 agent 默认 state 上挂三个运行期参数。
-    """
+    """在 agent 默认 state 上挂运行期参数。"""
 
     plugin: NotRequired[Any]
     event: NotRequired[Any]
     user_msg: NotRequired[str]
+    user_content: NotRequired[Any]
 
 
 # middleware 的泛型参数填 ChatAgentState，这样它们和 state_schema 一致，
@@ -77,10 +77,11 @@ async def send_message_tool(
     content: str,
     reply: bool = False,
     unlimit_length: bool = False,
-    # 下面三个参数 LLM 看不到，由 langgraph 从 agent state 注入
+    # 下面四个参数 LLM 看不到，由 langgraph 从 agent state 注入
     plugin: Annotated[Any, InjectedState("plugin")] = None,
     event: Annotated[Any, InjectedState("event")] = None,
     user_msg: Annotated[str, InjectedState("user_msg")] = "",
+    user_content: Annotated[Any, InjectedState("user_content")] = None,
 ) -> str:
     """向当前群聊发送一条消息。reply=true 表示发送；false 表示选择不发送！"""
     if plugin is None:
@@ -90,7 +91,9 @@ async def send_message_tool(
 
     if not reply or not content.strip():
         LOG.info("模型选择不回复")
-        plugin.add_context(bot_content="", message=user_msg)
+        plugin.add_context(
+            bot_content="", message=user_msg, user_content=user_content
+        )
         return "skipped"
 
     if event is not None:
@@ -102,7 +105,7 @@ async def send_message_tool(
         LOG.warning(
             f"send_message_tool: content 长度 {len(content)} 超过 20"
         )
-    plugin.add_context(bot_content=content, message=user_msg)
+    plugin.add_context(bot_content=content, message=user_msg, user_content=user_content)
     return "sent"
 
 def _patch_hindsight_run_async() -> None:
@@ -157,6 +160,8 @@ _MAX_FORWARD_DEPTH = 3
 _MAX_FORWARD_NODES = 50
 _MAX_FORWARD_CHARS = 4000
 _MAX_FORWARD_IMAGES = 8
+# 历史里保留带图片消息的轮数，超过后图片降级为 [图片] 占位
+_HISTORY_IMAGE_ROUNDS = 10
 
 ForwardFetcher = Callable[[str], Awaitable[Sequence[ForwardNode]]]
 
@@ -382,8 +387,8 @@ class AIPlugin(NcatBotPlugin):
         """AI 对话：LLM 通过 send_message 工具自行决定『要不要回/说什么』。
 
         本轮消息如果是多模态（带图片），把图片作为 image_url part 一起发给 LLM。
-        但写入历史 (assistent_messages) 的只有纯文本版本，图片用 [图片] 占位，
-        避免历史越攒越大、过期 URL 被反复引用。
+        历史 (assistent_messages) 里也会保留图片，但只保留最近 10 轮；
+        更早的轮次会降级为纯文本 + [图片] 占位，避免历史无限膨胀。
         """
         if not self.is_target_group(event.group_id):
             return
@@ -458,7 +463,8 @@ class AIPlugin(NcatBotPlugin):
             [system_chat, is_at_chat, self.get_now_time(), *history, user_chat],
             bank_id=uid,
             event=event,
-            user_msg=prefixed_text,   # 当前这轮用户消息，供 add_context 用
+            user_msg=prefixed_text,  # 当前这轮用户消息，供 add_context 用
+            user_content=user_chat_content,  # 带图片的版本，历史保留 10 轮
         )
         
 
@@ -543,11 +549,12 @@ class AIPlugin(NcatBotPlugin):
         bank_id: str,
         event: Any = None,
         user_msg: str = "",
+        user_content: Any = None,
     ) -> Any:
         """在指定 hindsight 记忆库下跑一次 agent。
 
-        event / user_msg 放进 state（不是 config["configurable"]），这样
-        send_message_tool 能通过 InjectedState 拿到它们。
+        event / user_msg / user_content 放进 state（不是 config["configurable"]），
+        这样 send_message_tool 能通过 InjectedState 拿到它们。
 
         切 bank 和 ainvoke 必须成对加锁：bank_id 挂在共享的 chat_llm 上，
         若中途被别的协程改掉，这次调用的记忆就会记到别人账上。
@@ -564,6 +571,7 @@ class AIPlugin(NcatBotPlugin):
             plugin=self,
             event=event,
             user_msg=user_msg,
+            user_content=user_content,
         )
         LOG.info("agent run: bank_id=%s", bank_id)
         async with self._bank_lock:
@@ -589,21 +597,26 @@ class AIPlugin(NcatBotPlugin):
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
 
-    def add_context(self, bot_content: str, message: str) -> None:
+    def add_context(
+        self,
+        bot_content: str,
+        message: str,
+        user_content: Any = None,
+    ) -> None:
         """记录一轮对话到上下文历史。
 
         message 是这一轮用户的发言（已是 "{name}: {text}" 形式）。
+        user_content 是带图片的多模态版本，存在历史里可以让最近几轮保留图片；
+        超过 ``_HISTORY_IMAGE_ROUNDS`` 轮后由 ``_prune_history_images`` 降级为占位。
         bot_content 是机器人的回复；空字符串表示机器人选择沉默，
         此时插入统一占位符 "...（已读未回）"，让对话轮次保持完整，
         避免 LLM 下一轮重复尝试回复同一条消息。
-
-        历史里存的是 LangChain 消息对象（HumanMessage / AIMessage），
-        图片不进历史，只留纯文本。
 
         追加走 langgraph 的 add_messages reducer 而不是 list.append：
         它会按消息 id 合并，重复调用同一条消息不会产生重复条目。
         """
         bot_text = bot_content if bot_content else "...（已读未回）"
+        human_content = user_content if user_content else message
         # 保留 add_messages 的核心语义：按消息 id 合并，重复的 id 覆盖旧值
         # 而不是追加一份。这里自己实现是因为 langgraph 1.4.2 的 Messages
         # 类型别名里只写了 BaseMessage，没写 HumanMessage/AIMessage 子类，
@@ -612,7 +625,7 @@ class AIPlugin(NcatBotPlugin):
             m.id: m for m in self.assistent_messages if m.id is not None
         }
         for msg in (
-            HumanMessage(content=message, id=f"u-{uuid4().hex}"),
+            HumanMessage(content=human_content, id=f"u-{uuid4().hex}"),
             AIMessage(content=bot_text, id=f"a-{uuid4().hex}"),
         ):
             assert msg.id is not None  # 上面刚显式给了 id
@@ -622,6 +635,46 @@ class AIPlugin(NcatBotPlugin):
         if len(history) > self.max_k:
             history = history[-self.max_k :]
         self.assistent_messages = history
+        self._prune_history_images()
+
+    @staticmethod
+    def _has_round_text(content: Any) -> bool:
+        """判断消息内容里是否有实际文字，空的主动说话轮次不计数。"""
+        if isinstance(content, str):
+            return bool(content.strip())
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, str) and part.strip():
+                    return True
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and str(part.get("text", "")).strip()
+                ):
+                    return True
+        return False
+
+    def _prune_history_images(self) -> None:
+        """只保留最近 N 轮用户消息里的图片，更早的图片降级为 [图片] 占位。"""
+        human_indices = [
+            i
+            for i, msg in enumerate(self.assistent_messages)
+            if isinstance(msg, HumanMessage) and self._has_round_text(msg.content)
+        ]
+        if len(human_indices) <= _HISTORY_IMAGE_ROUNDS:
+            return
+        cutoff = human_indices[-_HISTORY_IMAGE_ROUNDS]
+        for msg in self.assistent_messages[:cutoff]:
+            if not isinstance(msg, HumanMessage) or not isinstance(msg.content, list):
+                continue
+            stripped = [
+                part
+                for part in msg.content
+                if not (isinstance(part, dict) and part.get("type") == "image_url")
+            ]
+            if len(stripped) != len(msg.content):
+                msg.content = stripped
+
     async def get_user_name(self, user_id: int | str) -> str:
         """查询用户在该群的显示名，优先群昵称，回退到 QQ 昵称"""
         try:
@@ -715,8 +768,9 @@ class AIPlugin(NcatBotPlugin):
                 # base64:// 前缀按 ncatbot 约定转 data URI
                 if url.startswith("base64://"):
                     url = f"data:image/png;base64,{url[9:]}"
-                # 历史里只放占位
+                # 纯文本版本用占位；多模态版本保留图片，供最近几轮历史使用
                 text_buf.append("[图片] ")
+                multimodal_parts.append({"type": "text", "text": "[图片] "})
                 multimodal_parts.append(
                     {"type": "image_url", "image_url": {"url": url}}
                 )
