@@ -2,7 +2,7 @@ import asyncio
 import concurrent.futures
 import random
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Annotated, Any, NotRequired
 from uuid import uuid4
@@ -29,7 +29,19 @@ from langgraph.prebuilt.tool_node import InjectedState
 from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
 from ncatbot.plugin import NcatBotPlugin
-from ncatbot.types import At, Image, MessageArray, PlainText, Reply
+from ncatbot.types import (
+    At,
+    File,
+    Image,
+    MessageArray,
+    MessageSegment,
+    PlainText,
+    Record,
+    Reply,
+    Video,
+    parse_segment,
+)
+from ncatbot.types.qq import Face, Forward, ForwardNode, Json, Share
 from ncatbot.utils import get_config_manager, get_log
 
 from .time_controller import (
@@ -132,13 +144,91 @@ SYSTEM_PROMPT = SOUL_PROMPT + \
 
 GUIDELINES:
 你在一个群聊里面，你收到的消息不一定是发给你的，你需要根据上下文和语境来判断是否回复。
-对于一条消息，<quote>...</quote> 里面的内容是引用的消息，通常是你之前发过的消息或者其他人的消息，你需要根据这些引用来判断当前消息的语境。user_name : message 是用户发给你的消息, 不同的user_name代表不同的用户,你需要根据这些消息来判断每个用户的意图和情感。
+对于一条消息，<quote>...</quote> 里面的内容是引用的消息，通常是你之前发过的消息或者其他人的消息，你需要根据这些引用来判断当前消息的语境。<forward>...</forward> 里面是合并转发消息的内容，每条前面的名字是转发节点的发送者。user_name : message 是用户发给你的消息, 不同的user_name代表不同的用户,你需要根据这些消息来判断每个用户的意图和情感。
 重要！！！发送消息时，**必须**调用 send_message 工具；任何直接输出的文字都会被**完全丢弃**，不会作为消息内容发送!!!
 你可以自行决定是否调用 send_message 工具，或者直接忽略用户消息。不需要每一条都回复，像人一样选择性回复就行。
 不要输出markdown、代码块、表格、列表等格式化内容，直接输出纯文本即可。
 """
 
 
+# 合并转发可能非常长，解析时限制条数、嵌套层数和总字符数，避免撑爆上下文
+_MAX_FORWARD_DEPTH = 3
+_MAX_FORWARD_NODES = 50
+_MAX_FORWARD_CHARS = 4000
+
+ForwardFetcher = Callable[[str], Awaitable[Sequence[ForwardNode]]]
+
+
+async def _render_forward_segments(
+    segments: Sequence[Any],
+    fetch_forward: ForwardFetcher,
+    depth: int,
+) -> str:
+    """把转发节点里的一条消息拼成纯文本，媒体消息用占位符表示。"""
+    parts: list[str] = []
+    for seg in segments:
+        if isinstance(seg, PlainText):
+            parts.append(seg.text)
+        elif isinstance(seg, At):
+            parts.append(f"@{seg.user_id} ")
+        elif isinstance(seg, Image):
+            parts.append("[图片]")
+        elif isinstance(seg, Record):
+            parts.append("[语音]")
+        elif isinstance(seg, Video):
+            parts.append("[视频]")
+        elif isinstance(seg, File):
+            parts.append(f"[文件]{seg.file_name or seg.file}")
+        elif isinstance(seg, Face):
+            parts.append("[表情]")
+        elif isinstance(seg, Json):
+            parts.append("[卡片消息]")
+        elif isinstance(seg, Share):
+            parts.append("[链接分享]")
+        elif isinstance(seg, Reply):
+            # 转发节点里的引用没有上下文，跳过
+            continue
+        elif isinstance(seg, Forward):
+            if depth >= _MAX_FORWARD_DEPTH:
+                parts.append("[嵌套合并转发]")
+                continue
+            parts.append(await _render_forward(seg, fetch_forward, depth + 1))
+    return "".join(parts).strip()
+
+
+async def _render_forward(
+    forward: Forward,
+    fetch_forward: ForwardFetcher,
+    depth: int = 0,
+) -> str:
+    """把合并转发解析成 ``<forward>`` 文本块。
+
+    ``forward.content`` 有值时直接使用；只有 id 时通过 ``fetch_forward`` 拉取。
+    拉取失败返回占位文本，不向上抛异常。
+    """
+    nodes = forward.content
+    if not nodes and forward.id:
+        try:
+            nodes = list(await fetch_forward(forward.id))
+        except Exception as e:  # noqa: BLE001 - 网络/协议错误都应降级为占位文本
+            LOG.warning("解析合并转发失败 id=%s: %s", forward.id, e)
+            return "[合并转发（获取失败）]"
+    if not nodes:
+        return "[合并转发]"
+
+    lines = ["<forward>"]
+    for node in nodes[:_MAX_FORWARD_NODES]:
+        body = await _render_forward_segments(node.content, fetch_forward, depth)
+        name = node.nickname or node.user_id or "未知用户"
+        lines.append(f"{name}：{body or '[空消息]'}")
+    if len(nodes) > _MAX_FORWARD_NODES:
+        lines.append(f"...（还有 {len(nodes) - _MAX_FORWARD_NODES} 条）")
+    lines.append("</forward>")
+
+    rendered = "\n".join(lines)
+    if len(rendered) > _MAX_FORWARD_CHARS:
+        rendered = rendered[:_MAX_FORWARD_CHARS] + "\n...（合并转发过长，已截断）"
+    return rendered
 
 
 class AIPlugin(NcatBotPlugin):
@@ -266,7 +356,8 @@ class AIPlugin(NcatBotPlugin):
         if not self.is_target_group(event.group_id):
             return
         raw_text = event.message.text.strip()
-        if not raw_text and not event.message.filter_image():
+        has_forward = bool(event.message.filter(Forward))
+        if not raw_text and not event.message.filter_image() and not has_forward:
             return
     
         uid = str(event.user_id)
@@ -519,6 +610,30 @@ class AIPlugin(NcatBotPlugin):
         nickname: str = getattr(member_info, "nickname", "") or ""
         return card or nickname or "未知用户"
 
+    async def _fetch_forward_nodes(self, forward_id: str) -> Sequence[ForwardNode]:
+        """通过 NapCat 的 get_forward_msg 拉取合并转发节点。"""
+        data = await self.api.qq.query.get_forward_msg(forward_id)
+        nodes: list[ForwardNode] = []
+        for msg in data.messages:
+            sender = msg.sender
+            if sender is None:
+                continue
+            # 单条消息里可能有当前版本不认识的段，跳过错段而不是整条转发失败
+            content: list[MessageSegment] = []
+            for raw in msg.message or []:
+                try:
+                    content.append(parse_segment(raw))
+                except (TypeError, ValueError) as e:
+                    LOG.warning("跳过无法解析的转发消息段: %s", e)
+            nodes.append(
+                ForwardNode(
+                    user_id=sender.user_id,
+                    nickname=sender.card or sender.nickname or sender.user_id,
+                    content=content,
+                )
+            )
+        return nodes
+
     async def resolve_message_multimodal(
         self, messages: MessageArray
     ) -> tuple[str, Sequence[dict[str, Any]]]:
@@ -576,6 +691,14 @@ class AIPlugin(NcatBotPlugin):
             elif isinstance(seg, Reply):
                 # 已在外层 quote 块里处理过，这里跳过避免重复
                 continue
+            elif isinstance(seg, Forward):
+                forward_text = await _render_forward(seg, self._fetch_forward_nodes)
+                # 与前面的正文隔开，避免 "看这个<forward>" 粘在一起
+                prefix = "\n" if text_buf and not text_buf[-1].endswith("\n") else ""
+                text_buf.append(f"{prefix}{forward_text}\n")
+                multimodal_parts.append(
+                    {"type": "text", "text": f"{prefix}{forward_text}\n"}
+                )
             else:
                 LOG.info("resolve_message_multimodal: 跳过段 %s", type(seg).__name__)
 

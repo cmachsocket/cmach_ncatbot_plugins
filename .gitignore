@@ -17,3 +17,4 @@ output/
 uv.lock
 *.db
 pyrightconfig.json
+.ruff_cache/

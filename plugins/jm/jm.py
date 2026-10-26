@@ -24,7 +24,7 @@ async def txt2img(text: str) -> str:
             return out_path
         await asyncio.to_thread(render, text, theme="dark", out=out_path)
         return out_path
-    except Exception as e:
+    except (OSError, ValueError, TypeError):
         return ""
 
 async def comic_download(id: int) -> tuple[bool, str]:
@@ -39,8 +39,6 @@ async def comic_download(id: int) -> tuple[bool, str]:
         return (False, (f"呜喵…下载失败了呢喵～"))
     except jmcomic.JmcomicException as e:
         return (False, (f"呜喵…JM 出错了喵～"))
-    except Exception as e:
-        return (False, (f"呜喵…奇怪的错误发生了喵～"))
     if os.path.exists(f"down/{id}.pdf"):
         return (True, f"down/{id}.pdf")
     else:
@@ -59,9 +57,6 @@ async def comic_detail(id: int) -> tuple[bool, str]:
             return (False, f"呜喵…请求都失败了喵～")
         except jmcomic.JmcomicException as e:
             return (False, f"呜喵…详情抓取出错了喵")
-        except Exception as e:
-            return (False, f"呜喵…奇怪的错误发生了喵～")
-
     def join_list(items):
         return "、".join(str(x) for x in items) if items else "无"
 
@@ -115,8 +110,6 @@ class JmPlugin(NcatBotPlugin):
             await self.api.qq.send_group_file(event.group_id,result[1],name=file)
         except asyncio.TimeoutError as e:
             print("WARN : 呜喵…文件发送超时了喵，快看看是不是已经发出去过了喵～")
-        except Exception as e:
-            await self.api.qq.send_group_plain_text(event.group_id,f"呜喵…ncatbot 发送出错了喵～")
     @registrar.on_group_command("/jmd",ignore_case=True)
     async def on_gourp_jm_detail(self,event:GroupMessageEvent) -> None :
         parts=event.message.text.split(" ")
@@ -138,11 +131,13 @@ class JmPlugin(NcatBotPlugin):
             await event.reply(text=result[1])
         else:
             if len(parts) > 2:
-                raise Exception("进入纯文本输出模式了喵～")
+                await event.reply(text=result[1])
+                return
             try:
                 img_path = await txt2img(result[1])
                 if not img_path:
-                    raise Exception("文本转图片失败了喵～")
+                    await event.reply(text=result[1])
+                    return
                 await self.api.qq.send_group_image(event.group_id,img_path)
-            except Exception as e:
+            except (OSError, ValueError, TypeError):
                 await event.reply(text=result[1])
