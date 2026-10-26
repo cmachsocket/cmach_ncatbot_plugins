@@ -1,24 +1,21 @@
+import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from zoneinfo import ZoneInfo
 
-from ncatbot.plugin import NcatBotPlugin
-from ncatbot.event.qq import PrivateMessageEvent
-from ncatbot.core import registrar
-from caldav import aio
+import recurring_ical_events
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from caldav import SynchronizableCalendarObjectCollection, aio
 from icalendar import Calendar
 from icalendar.cal import Event as ICalEvent
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.triggers.date import DateTrigger
-from apscheduler.jobstores.memory import MemoryJobStore
-from apscheduler.jobstores.base import JobLookupError
-from caldav import SynchronizableCalendarObjectCollection
-
-import recurring_ical_events
-import asyncio
-
+from ncatbot.core import registrar
+from ncatbot.event.qq import PrivateMessageEvent
+from ncatbot.plugin import NcatBotPlugin
 
 #: 通知作业 id 前缀，形如 caldav_notify:{uid}:{occurrence-id-iso}
 NOTIFY_JOB_PREFIX = "caldav_notify:"
@@ -63,7 +60,7 @@ class NotifyPlugin(NcatBotPlugin):
     caldav_url: str
     caldav_user: str
     caldav_password: str
-    davclient: "aio.AsyncDAVClient"
+    davclient: aio.AsyncDAVClient
     scheduler: AsyncIOScheduler
     sync_tokens: dict[str, str]   # {calendar_url: sync_token}
     snapshot: dict[str, str]      # {对象绝对URL: uid}
@@ -303,7 +300,7 @@ class NotifyPlugin(NcatBotPlugin):
             try:
                 # 用完整 Calendar 展开，自动处理 RRULE / EXDATE / 覆盖实例
                 occurrences = recurring_ical_events.of(change.calendar).between(now, horizon)
-            except Exception as exc:
+            except (KeyError, TypeError, ValueError) as exc:
                 self.logger.warning(f"展开事件失败 {change.href}: {exc}")
                 continue
 
@@ -355,7 +352,7 @@ class NotifyPlugin(NcatBotPlugin):
             self._last_full_sync = now
         try:
             changes = await self.get_calendar_events()
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             self.logger.error(f"拉取 CalDAV 失败: {exc}")
             return -1, self._pending_job_count()
         if changes:
@@ -381,7 +378,7 @@ class NotifyPlugin(NcatBotPlugin):
                 self.logger.error(f"{SYNC_COMMAND} 同步超时（>{SYNC_TIMEOUT_SECONDS}s）")
                 await event.reply(text=f"同步超时（>{SYNC_TIMEOUT_SECONDS}s），详见日志。")
                 return
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 self.logger.error(f"{SYNC_COMMAND} 同步异常: {exc}")
                 await event.reply(text="同步出错，详见日志。")
                 return

@@ -1,14 +1,14 @@
-from jmcomic import JmOption, download_album, Feature,JmModuleConfig
-import jmcomic
 import asyncio
 import hashlib
 import os
 
+import jmcomic
 from jm.text2img import render
+from jmcomic import Feature, JmModuleConfig, JmOption
 from ncatbot.core import registrar
-from ncatbot.event import HasSender
-from ncatbot.plugin import NcatBotPlugin
 from ncatbot.event.qq import GroupMessageEvent
+from ncatbot.plugin import NcatBotPlugin
+
 
 async def get_domain() -> None:
     domain_list = JmModuleConfig.get_html_domain_all()
@@ -106,6 +106,7 @@ class JmPlugin(NcatBotPlugin):
                 result = await comic_download(id)
         except asyncio.TimeoutError:
             await event.reply(text="呜喵…下载太慢了啦，等了好久都没好喵～")
+            return
         if not result[0]:
             await event.reply(text=result[1])
             return
@@ -132,6 +133,7 @@ class JmPlugin(NcatBotPlugin):
                 result = await comic_detail(id)
         except asyncio.TimeoutError:
             await event.reply(text="呜喵…详情拉取太慢了喵～")
+            return
         if not result[0]:
             await event.reply(text=result[1])
         else:

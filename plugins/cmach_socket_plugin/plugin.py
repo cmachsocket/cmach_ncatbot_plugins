@@ -1,8 +1,8 @@
 """模板插件 — 发送 hello 回复 hi (QQ)。"""
 
-from ncatbot.plugin import NcatBotPlugin
 from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent, PrivateMessageEvent
+from ncatbot.plugin import NcatBotPlugin
 
 
 class CmachSocketPlugin(NcatBotPlugin):

@@ -1,41 +1,40 @@
-from ncatbot.core import registrar
-from ncatbot.event.qq import GroupMessageEvent
-from ncatbot.plugin import NcatBotPlugin
-import hindsight_litellm
-from .time_controller import (
-    TemperatureController,
-)
 import asyncio
 import concurrent.futures
 import random
 import time
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Annotated, Any, Dict, Iterable, List, Optional, Sequence, Union
-from typing_extensions import NotRequired
+from typing import Annotated, Any, NotRequired
 from uuid import uuid4
-from ncatbot.utils import get_log
 
-from ncatbot.types import MessageArray,Reply,PlainText,At,Image
-
+import hindsight_litellm
+import litellm
 from langchain.agents import AgentState, create_agent
 from langchain.agents.middleware import (
     SummarizationMiddleware,
     ToolCallLimitMiddleware,
 )
-from langgraph.prebuilt.tool_node import InjectedState
-from langchain_litellm import ChatLiteLLM
-from ncatbot.utils import get_config_manager
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
     SystemMessage,
     convert_to_messages,
+    convert_to_openai_messages,
     trim_messages,
 )
 from langchain_core.tools import tool
-import litellm
-from langchain_core.messages import convert_to_openai_messages
+from langchain_litellm import ChatLiteLLM
+from langgraph.prebuilt.tool_node import InjectedState
+from ncatbot.core import registrar
+from ncatbot.event.qq import GroupMessageEvent
+from ncatbot.plugin import NcatBotPlugin
+from ncatbot.types import At, Image, MessageArray, PlainText, Reply
+from ncatbot.utils import get_config_manager, get_log
+
+from .time_controller import (
+    TemperatureController,
+)
 
 LOG = get_log("AIPlugin")
 
@@ -148,20 +147,20 @@ class AIPlugin(NcatBotPlugin):
     hindsight: Any = None
     hindsight_port: int = 7071
     target_group_id: int = 1093424135
-    bot_id: Optional[str] = None
+    bot_id: str | None = None
     # 历史里只有 HumanMessage / AIMessage 两种，不含 ToolMessage 等
-    assistent_messages: List[Union[HumanMessage, AIMessage]] = []
+    assistent_messages: list[HumanMessage | AIMessage]
     max_k: int = 60  # 历史消息条数缓存上限（内存层面，token 由 token_base × 倍率 限制）
     # 上下文 token 预算的基准值。实际预算 = 4096 × clamp(温度, 0.5, 1.5)
     # 即 2048 ~ 6144 之间浮动，由 TemperatureController 计算。
     context_budget: int = 4096
-    _bg_task: Optional[asyncio.Task[None]] = None
+    _bg_task: asyncio.Task[None] | None = None
     # 上次收到真实用户消息的 monotonic 时间，用于主动说话沉默计时
     _last_user_msg_at: float = 0.0
     model : str
     api_key : str
     base_url : str
-    chat_llm : Optional[ChatLiteLLM] = None
+    chat_llm : ChatLiteLLM | None = None
     agent: Any = None
     # hindsight 记忆库：群消息按 user_id 分库，主动说话固定用 self
     PROACTIVE_BANK_ID: str = "self"
@@ -253,7 +252,7 @@ class AIPlugin(NcatBotPlugin):
 
         try:
             return litellm.token_counter(model=self.model, messages=openai_msgs)
-        except Exception as e:
+        except (KeyError, TypeError, ValueError) as e:
             raise RuntimeError(f"计算 token 数量时出错: {e}")
 
     @registrar.qq.on_group_message()
@@ -296,7 +295,7 @@ class AIPlugin(NcatBotPlugin):
                 {"type": "text", "text": f"{user_name}: "},
                 *mm_parts,
             ]
-            user_chat_content: str | Sequence[Dict[str, Any]] = mm_parts
+            user_chat_content: str | Sequence[dict[str, Any]] = mm_parts
         else:
             user_chat_content = prefixed_text
 
@@ -399,7 +398,7 @@ class AIPlugin(NcatBotPlugin):
                 )
             except asyncio.CancelledError:
                 break
-            except Exception as e:
+            except (RuntimeError, ValueError) as e:
                 self.logger.warning("proactive loop error: %s", e)
 
     def _set_hindsight_bank(self, bank_id: str) -> None:
@@ -486,7 +485,7 @@ class AIPlugin(NcatBotPlugin):
         # 而不是追加一份。这里自己实现是因为 langgraph 1.4.2 的 Messages
         # 类型别名里只写了 BaseMessage，没写 HumanMessage/AIMessage 子类，
         # 传具体子类列表过不了类型检查（运行时是正常的）。
-        merged: Dict[str, Union[HumanMessage, AIMessage]] = {
+        merged: dict[str, HumanMessage | AIMessage] = {
             m.id: m for m in self.assistent_messages if m.id is not None
         }
         for msg in (
@@ -508,7 +507,7 @@ class AIPlugin(NcatBotPlugin):
             member_info = await self.api.qq.query.get_group_member_info(
                 self.target_group_id, user_id
             )
-        except Exception as e:
+        except (ConnectionError, TimeoutError) as e:
             self.logger.warning("获取群成员信息失败 user_id=%s: %s", user_id, e)
             return "未知用户"
 
@@ -522,7 +521,7 @@ class AIPlugin(NcatBotPlugin):
 
     async def resolve_message_multimodal(
         self, messages: MessageArray
-    ) -> tuple[str, Sequence[Dict[str, Any]]]:
+    ) -> tuple[str, Sequence[dict[str, Any]]]:
         """把 MessageArray 拆成 (纯文本, 多模态 parts)。
         """
         text_buf: list[str] = []
@@ -549,7 +548,7 @@ class AIPlugin(NcatBotPlugin):
             quote_lines.append("</quote>")
             text_buf.append("\n".join(quote_lines) + "\n")
 
-        multimodal_parts: List[Dict[str, Any]] = []
+        multimodal_parts: list[dict[str, Any]] = []
         for seg in messages:
             if isinstance(seg, PlainText):
                 text_buf.append(seg.text)

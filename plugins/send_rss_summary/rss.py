@@ -1,7 +1,8 @@
-from ncatbot.plugin import NcatBotPlugin
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pathlib import Path
+
 import rssfetch
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from ncatbot.plugin import NcatBotPlugin
 
 #: rssfetch 的配置文件固定放在插件目录下，不受运行时工作目录影响
 CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
