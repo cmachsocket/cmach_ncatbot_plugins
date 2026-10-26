@@ -4,7 +4,7 @@ import asyncio
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -15,6 +15,7 @@ from ncatbot.types.qq import Forward, ForwardNode
 
 from plugins.chat_bot.chat_bot import (
     _MAX_FORWARD_CHARS,
+    _MAX_FORWARD_IMAGES,
     AIPlugin,
     _render_forward,
 )
@@ -54,7 +55,8 @@ def test_render_inline_forward_content() -> None:
 
     result = _run(_render_forward(forward, _no_fetch))
 
-    assert result == "<forward>\nAlice：你好[图片]@2\n</forward>"
+    assert result.text == "<forward>\nAlice：你好[图片]@2\n</forward>"
+    assert result.images == ["https://x"]
 
 
 def test_render_forward_by_id_fetches_nodes() -> None:
@@ -67,7 +69,7 @@ def test_render_forward_by_id_fetches_nodes() -> None:
     result = _run(_render_forward(Forward(id="fid"), fetch))
 
     assert fetched == ["fid"]
-    assert result == "<forward>\nBob：拉取成功\n</forward>"
+    assert result.text == "<forward>\nBob：拉取成功\n</forward>"
 
 
 def test_render_forward_fetch_failure_returns_placeholder() -> None:
@@ -76,11 +78,11 @@ def test_render_forward_fetch_failure_returns_placeholder() -> None:
 
     result = _run(_render_forward(Forward(id="bad"), fetch))
 
-    assert result == "[合并转发（获取失败）]"
+    assert result.text == "[合并转发（获取失败）]"
 
 
 def test_render_forward_without_content_or_id() -> None:
-    assert _run(_render_forward(Forward(), _no_fetch)) == "[合并转发]"
+    assert _run(_render_forward(Forward(), _no_fetch)).text == "[合并转发]"
 
 
 def test_render_nested_forward_inline() -> None:
@@ -93,8 +95,8 @@ def test_render_nested_forward_inline() -> None:
 
     result = _run(_render_forward(outer, _no_fetch))
 
-    assert "Outer：" in result
-    assert "<forward>\nInner：内层\n</forward>" in result
+    assert "Outer：" in result.text
+    assert "<forward>\nInner：内层\n</forward>" in result.text
 
 
 def test_render_forward_truncates_long_content() -> None:
@@ -104,9 +106,41 @@ def test_render_forward_truncates_long_content() -> None:
 
     result = _run(_render_forward(forward, _no_fetch))
 
-    assert len(result) > _MAX_FORWARD_CHARS
-    assert result.startswith("<forward>\nA：xxx")
-    assert result.endswith("...（合并转发过长，已截断）")
+    assert len(result.text) > _MAX_FORWARD_CHARS
+    assert result.text.startswith("<forward>\nA：xxx")
+    assert result.text.endswith("...（合并转发过长，已截断）")
+
+
+def test_render_forward_collects_image_urls() -> None:
+    forward = Forward(
+        content=[
+            _node(
+                "A",
+                {"type": "image", "data": {"file": "a.jpg", "url": "https://x"}},
+                {"type": "image", "data": {"file": "b.jpg", "url": "base64://QUJD"}},
+                {"type": "image", "data": {"file": "/tmp/c.jpg"}},
+            )
+        ]
+    )
+
+    result = _run(_render_forward(forward, _no_fetch))
+
+    assert result.text == "<forward>\nA：[图片][图片][图片]\n</forward>"
+    assert result.images == ["https://x", "data:image/png;base64,QUJD"]
+
+
+def test_render_forward_limits_images() -> None:
+    segments = [
+        {"type": "image", "data": {"file": f"{i}.jpg", "url": f"https://x/{i}"}}
+        for i in range(_MAX_FORWARD_IMAGES + 2)
+    ]
+    forward = Forward(content=[_node("A", *segments)])
+
+    result = _run(_render_forward(forward, _no_fetch))
+
+    assert len(result.images) == _MAX_FORWARD_IMAGES
+    assert result.images[0] == "https://x/0"
+    assert result.text.count("[图片]") == _MAX_FORWARD_IMAGES + 2
 
 
 class _FakePlugin:
@@ -123,12 +157,33 @@ def test_resolve_message_multimodal_includes_forward() -> None:
     )
 
     text, parts = _run(
-        AIPlugin.resolve_message_multimodal(_FakePlugin(), message)  # type: ignore[arg-type]
+        AIPlugin.resolve_message_multimodal(cast(Any, _FakePlugin()), message)
     )
 
     assert "看这个" in text
     assert "\n<forward>\nBob：fid=f1\n</forward>" in text
     assert parts == []
+
+
+class _FakePluginWithImage:
+    async def _fetch_forward_nodes(self, forward_id: str) -> Sequence[ForwardNode]:
+        return [
+            _node(
+                "Bob",
+                {"type": "image", "data": {"file": "a.jpg", "url": "https://x"}},
+            )
+        ]
+
+
+def test_resolve_message_multimodal_includes_forward_images() -> None:
+    message = MessageArray.from_any([Forward(id="f1")])
+
+    text, parts = _run(
+        AIPlugin.resolve_message_multimodal(cast(Any, _FakePluginWithImage()), message)
+    )
+
+    assert text == "<forward>\nBob：[图片]\n</forward>\n"
+    assert {"type": "image_url", "image_url": {"url": "https://x"}} in parts
 
 
 class _Sender:

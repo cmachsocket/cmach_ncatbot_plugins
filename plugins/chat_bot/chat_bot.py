@@ -3,6 +3,7 @@ import concurrent.futures
 import random
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, NotRequired
 from uuid import uuid4
@@ -151,21 +152,43 @@ GUIDELINES:
 """
 
 
-# 合并转发可能非常长，解析时限制条数、嵌套层数和总字符数，避免撑爆上下文
+# 合并转发可能非常长，解析时限制条数、嵌套层数、图片数和总字符数，避免撑爆上下文
 _MAX_FORWARD_DEPTH = 3
 _MAX_FORWARD_NODES = 50
 _MAX_FORWARD_CHARS = 4000
+_MAX_FORWARD_IMAGES = 8
 
 ForwardFetcher = Callable[[str], Awaitable[Sequence[ForwardNode]]]
 
 
+@dataclass
+class _ForwardContent:
+    """合并转发的解析结果：纯文本版本 + 可发给 LLM 的图片 URL。"""
+
+    text: str
+    images: list[str] = field(default_factory=list)
+
+
+def _forward_image_url(image: Image) -> str | None:
+    """取出转发图片可被 LLM 访问的 URL，无法访问时返回 None。"""
+    url = image.url or image.file or ""
+    if not url:
+        return None
+    if url.startswith("base64://"):
+        url = f"data:image/png;base64,{url[9:]}"
+    if url.startswith(("http://", "https://", "data:image/")):
+        return url
+    return None
+
+
 async def _render_forward_segments(
-    segments: Sequence[Any],
+    segments: Sequence[MessageSegment],
     fetch_forward: ForwardFetcher,
     depth: int,
-) -> str:
-    """把转发节点里的一条消息拼成纯文本，媒体消息用占位符表示。"""
+) -> _ForwardContent:
+    """把转发节点里的一条消息拼成纯文本，同时收集其中的图片。"""
     parts: list[str] = []
+    images: list[str] = []
     for seg in segments:
         if isinstance(seg, PlainText):
             parts.append(seg.text)
@@ -173,6 +196,9 @@ async def _render_forward_segments(
             parts.append(f"@{seg.user_id} ")
         elif isinstance(seg, Image):
             parts.append("[图片]")
+            url = _forward_image_url(seg)
+            if url and len(images) < _MAX_FORWARD_IMAGES:
+                images.append(url)
         elif isinstance(seg, Record):
             parts.append("[语音]")
         elif isinstance(seg, Video):
@@ -192,16 +218,19 @@ async def _render_forward_segments(
             if depth >= _MAX_FORWARD_DEPTH:
                 parts.append("[嵌套合并转发]")
                 continue
-            parts.append(await _render_forward(seg, fetch_forward, depth + 1))
-    return "".join(parts).strip()
+            nested = await _render_forward(seg, fetch_forward, depth + 1)
+            parts.append(nested.text)
+            remaining = _MAX_FORWARD_IMAGES - len(images)
+            images.extend(nested.images[:remaining])
+    return _ForwardContent("".join(parts).strip(), images)
 
 
 async def _render_forward(
     forward: Forward,
     fetch_forward: ForwardFetcher,
     depth: int = 0,
-) -> str:
-    """把合并转发解析成 ``<forward>`` 文本块。
+) -> _ForwardContent:
+    """把合并转发解析成 ``<forward>`` 文本块，并附带其中的图片。
 
     ``forward.content`` 有值时直接使用；只有 id 时通过 ``fetch_forward`` 拉取。
     拉取失败返回占位文本，不向上抛异常。
@@ -212,15 +241,18 @@ async def _render_forward(
             nodes = list(await fetch_forward(forward.id))
         except Exception as e:  # noqa: BLE001 - 网络/协议错误都应降级为占位文本
             LOG.warning("解析合并转发失败 id=%s: %s", forward.id, e)
-            return "[合并转发（获取失败）]"
+            return _ForwardContent("[合并转发（获取失败）]")
     if not nodes:
-        return "[合并转发]"
+        return _ForwardContent("[合并转发]")
 
     lines = ["<forward>"]
+    images: list[str] = []
     for node in nodes[:_MAX_FORWARD_NODES]:
         body = await _render_forward_segments(node.content, fetch_forward, depth)
         name = node.nickname or node.user_id or "未知用户"
-        lines.append(f"{name}：{body or '[空消息]'}")
+        lines.append(f"{name}：{body.text or '[空消息]'}")
+        remaining = _MAX_FORWARD_IMAGES - len(images)
+        images.extend(body.images[:remaining])
     if len(nodes) > _MAX_FORWARD_NODES:
         lines.append(f"...（还有 {len(nodes) - _MAX_FORWARD_NODES} 条）")
     lines.append("</forward>")
@@ -228,7 +260,7 @@ async def _render_forward(
     rendered = "\n".join(lines)
     if len(rendered) > _MAX_FORWARD_CHARS:
         rendered = rendered[:_MAX_FORWARD_CHARS] + "\n...（合并转发过长，已截断）"
-    return rendered
+    return _ForwardContent(rendered, images)
 
 
 class AIPlugin(NcatBotPlugin):
@@ -692,13 +724,17 @@ class AIPlugin(NcatBotPlugin):
                 # 已在外层 quote 块里处理过，这里跳过避免重复
                 continue
             elif isinstance(seg, Forward):
-                forward_text = await _render_forward(seg, self._fetch_forward_nodes)
+                forward = await _render_forward(seg, self._fetch_forward_nodes)
                 # 与前面的正文隔开，避免 "看这个<forward>" 粘在一起
                 prefix = "\n" if text_buf and not text_buf[-1].endswith("\n") else ""
-                text_buf.append(f"{prefix}{forward_text}\n")
+                text_buf.append(f"{prefix}{forward.text}\n")
                 multimodal_parts.append(
-                    {"type": "text", "text": f"{prefix}{forward_text}\n"}
+                    {"type": "text", "text": f"{prefix}{forward.text}\n"}
                 )
+                for url in forward.images:
+                    multimodal_parts.append(
+                        {"type": "image_url", "image_url": {"url": url}}
+                    )
             else:
                 LOG.info("resolve_message_multimodal: 跳过段 %s", type(seg).__name__)
 
