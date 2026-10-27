@@ -391,14 +391,13 @@ class AIPlugin(NcatBotPlugin):
         本轮消息如果是多模态（带图片），把图片作为 image_url part 一起发给 LLM。
         历史 (assistent_messages) 里也会保留图片，但只保留最近 10 轮；
         更早的轮次会降级为纯文本 + [图片] 占位，避免历史无限膨胀。
+        语音消息会先转成文字，转写失败时退化成 [语音] 占位。
         """
         if not self.is_target_group(event.group_id):
             return
-        raw_text = event.message.text.strip()
-        has_forward = bool(event.message.filter(Forward))
-        if not raw_text and not event.message.filter_image() and not has_forward:
+        if not self._should_process(event.message):
             return
-    
+
         uid = str(event.user_id)
         if uid == self.bot_id:
             # 机器人自己发的消息不处理，避免死循环
@@ -412,7 +411,9 @@ class AIPlugin(NcatBotPlugin):
 
         user_name = await self.get_user_name(event.user_id)
         # 同时拿到：① 纯文本（用于历史）② 多模态 parts（用于本轮 LLM 调用）
-        user_text, mm_parts = await self.resolve_message_multimodal(event.message)
+        user_text, mm_parts = await self.resolve_message_multimodal(
+            event.message, message_id=event.message_id
+        )
         if not user_text.strip():
             return
         prefixed_text = f"{user_name}: {user_text}"
@@ -599,6 +600,19 @@ class AIPlugin(NcatBotPlugin):
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
 
+    @staticmethod
+    def _should_process(message: MessageArray) -> bool:
+        """判断这条消息是否需要进入 AI 处理流程。
+
+        纯文本、图片、合并转发、语音都算有效消息；
+        只有表情、@ 这类没有内容的消息才直接忽略。
+        """
+        if message.text.strip():
+            return True
+        return bool(
+            message.filter_image() or message.filter(Forward) or message.filter(Record)
+        )
+
     def add_context(
         self,
         bot_content: str,
@@ -721,8 +735,24 @@ class AIPlugin(NcatBotPlugin):
             )
         return nodes
 
+    async def fetch_voice_text(self, message_id: str | int | None) -> str:
+        """用 NapCat 的 fetch_ptt_text 把语音消息转成文字。
+
+        转写失败或结果为空时返回空字符串，由调用方退化成占位文本。
+        """
+        if message_id is None:
+            return ""
+        try:
+            result = await self.api.qq.query.fetch_ptt_text(message_id)
+        except Exception as e:  # noqa: BLE001 - 网络/协议错误都应降级为占位文本
+            LOG.warning("语音转文字失败 message_id=%s: %s", message_id, e)
+            return ""
+        return (result.text or "").strip()
+
     async def resolve_message_multimodal(
-        self, messages: MessageArray
+        self,
+        messages: MessageArray,
+        message_id: str | int | None = None,
     ) -> tuple[str, Sequence[dict[str, Any]]]:
         """把 MessageArray 拆成 (纯文本, 多模态 parts)。
         """
@@ -750,6 +780,11 @@ class AIPlugin(NcatBotPlugin):
             quote_lines.append("</quote>")
             text_buf.append("\n".join(quote_lines) + "\n")
 
+        # 语音转写按消息 ID 查，一条消息只查一次
+        voice_text = ""
+        if messages.filter(Record):
+            voice_text = await self.fetch_voice_text(message_id)
+
         multimodal_parts: list[dict[str, Any]] = []
         for seg in messages:
             if isinstance(seg, PlainText):
@@ -776,6 +811,11 @@ class AIPlugin(NcatBotPlugin):
                 multimodal_parts.append(
                     {"type": "image_url", "image_url": {"url": url}}
                 )
+            elif isinstance(seg, Record):
+                # 转写成功时把文字内容带上，转写失败则退化成占位
+                voice = f"[语音] {voice_text}" if voice_text else "[语音]"
+                text_buf.append(voice)
+                multimodal_parts.append({"type": "text", "text": voice})
             elif isinstance(seg, Reply):
                 # 已在外层 quote 块里处理过，这里跳过避免重复
                 continue

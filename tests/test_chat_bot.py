@@ -2,7 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -16,6 +16,9 @@ class _Query:
         self.member_info: Any = SimpleNamespace(card="群名片", nickname="昵称")
         self.member_error: Exception | None = None
         self.messages: dict[str, Any] = {}
+        self.ptt_text: str = ""
+        self.ptt_error: Exception | None = None
+        self.ptt_calls: list[str] = []
 
     async def get_group_member_info(self, group_id: int, user_id: int | str) -> Any:
         if self.member_error is not None:
@@ -24,6 +27,12 @@ class _Query:
 
     async def get_msg(self, message_id: str) -> Any:
         return self.messages.get(message_id)
+
+    async def fetch_ptt_text(self, message_id: str) -> Any:
+        self.ptt_calls.append(message_id)
+        if self.ptt_error is not None:
+            raise self.ptt_error
+        return SimpleNamespace(text=self.ptt_text)
 
 
 class _QQ:
@@ -194,6 +203,7 @@ def test_resolve_message_adds_image_parts(monkeypatch) -> None:
     assert text == "look[图片] "
     assert parts == [
         {"type": "text", "text": "look"},
+        {"type": "text", "text": "[图片] "},
         {"type": "image_url", "image_url": {"url": "https://img/a.jpg"}},
     ]
 
@@ -211,10 +221,11 @@ def test_resolve_message_converts_base64_image(monkeypatch) -> None:
     )
 
     assert parts == [
+        {"type": "text", "text": "[图片] "},
         {
             "type": "image_url",
             "image_url": {"url": "data:image/png;base64,AAAA"},
-        }
+        },
     ]
 
 
@@ -291,6 +302,133 @@ def test_resolve_message_ignores_unknown_segments(caplog) -> None:
     assert text == "hi"
     assert parts == []
     assert "跳过段" in caplog.text
+
+
+# ---------- 语音转文字 ----------
+
+
+def _fake_query(plugin: chat_module.AIPlugin) -> _Query:
+    """取出测试用的假 query（真实类型是 ncatbot 的 QQQuery）。"""
+    return cast(_Query, plugin.api.qq.query)
+
+
+def test_resolve_message_transcribes_voice() -> None:
+    plugin = _plugin()
+    query = _fake_query(plugin)
+    query.ptt_text = "今天天气不错"
+
+    text, parts = asyncio.run(
+        plugin.resolve_message_multimodal(
+            _message({"type": "record", "data": {"file": "a.silk"}}),
+            message_id="m1",
+        )
+    )
+
+    assert text == "[语音] 今天天气不错"
+    assert query.ptt_calls == ["m1"]
+    assert parts == []
+
+
+def test_resolve_message_voice_placeholder_when_transcription_fails(caplog) -> None:
+    plugin = _plugin()
+    _fake_query(plugin).ptt_error = ConnectionError("offline")
+
+    with caplog.at_level("WARNING"):
+        text, _ = asyncio.run(
+            plugin.resolve_message_multimodal(
+                _message({"type": "record", "data": {"file": "a.silk"}}),
+                message_id="m1",
+            )
+        )
+
+    assert text == "[语音]"
+    assert "语音转文字失败" in caplog.text
+
+
+def test_resolve_message_voice_placeholder_when_transcription_empty() -> None:
+    plugin = _plugin()
+    _fake_query(plugin).ptt_text = "  "
+
+    text, _ = asyncio.run(
+        plugin.resolve_message_multimodal(
+            _message({"type": "record", "data": {"file": "a.silk"}}),
+            message_id="m1",
+        )
+    )
+
+    assert text == "[语音]"
+
+
+def test_resolve_message_queries_ptt_once_per_message() -> None:
+    plugin = _plugin()
+    query = _fake_query(plugin)
+    query.ptt_text = "在的"
+
+    text, _ = asyncio.run(
+        plugin.resolve_message_multimodal(
+            _message(
+                {"type": "record", "data": {"file": "a.silk"}},
+                {"type": "record", "data": {"file": "b.silk"}},
+            ),
+            message_id="m1",
+        )
+    )
+
+    assert text == "[语音] 在的[语音] 在的"
+    assert query.ptt_calls == ["m1"]
+
+
+def test_resolve_message_does_not_query_ptt_without_voice() -> None:
+    plugin = _plugin()
+
+    text, _ = asyncio.run(
+        plugin.resolve_message_multimodal(
+            _message({"type": "text", "data": {"text": "hi"}}),
+            message_id="m1",
+        )
+    )
+
+    assert text == "hi"
+    assert _fake_query(plugin).ptt_calls == []
+
+
+def test_fetch_voice_text_without_message_id_is_empty() -> None:
+    plugin = _plugin()
+
+    assert asyncio.run(plugin.fetch_voice_text(None)) == ""
+    assert _fake_query(plugin).ptt_calls == []
+
+
+def test_fetch_voice_text_returns_transcribed_text() -> None:
+    plugin = _plugin()
+    query = _fake_query(plugin)
+    query.ptt_text = "  你好  "
+
+    assert asyncio.run(plugin.fetch_voice_text("m1")) == "你好"
+    assert query.ptt_calls == ["m1"]
+
+
+def test_fetch_voice_text_swallows_api_error(caplog) -> None:
+    plugin = _plugin()
+    _fake_query(plugin).ptt_error = RuntimeError("boom")
+
+    with caplog.at_level("WARNING"):
+        assert asyncio.run(plugin.fetch_voice_text("m1")) == ""
+
+    assert "语音转文字失败" in caplog.text
+
+
+def test_should_process_accepts_voice_only_message() -> None:
+    assert (
+        chat_module.AIPlugin._should_process(
+            _message({"type": "record", "data": {"file": "a.silk"}})
+        )
+        is True
+    )
+
+
+def test_should_process_rejects_empty_message() -> None:
+    assert chat_module.AIPlugin._should_process(_message()) is False
 
 
 # ---------- 发送与上下文工具 ----------
