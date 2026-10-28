@@ -44,6 +44,7 @@ from ncatbot.types import (
 )
 from ncatbot.types.qq import Face, Forward, ForwardNode, Json, Share
 from ncatbot.utils import get_config_manager, get_log
+from openai import max_retries
 
 from .time_controller import (
     TemperatureController,
@@ -339,6 +340,7 @@ class AIPlugin(NcatBotPlugin):
                 # hindsight_bank_id 从 model_kwargs 进，每次调用前由
                 # _set_hindsight_bank 改写，区分不同用户的记忆库。
                 model_kwargs={"hindsight_bank_id": self.PROACTIVE_BANK_ID},
+                max_retries=5,
             )
         if self.chat_llm:
             # middleware 参数的 type: ignore 是必要的：langchain 1.4.2 把
