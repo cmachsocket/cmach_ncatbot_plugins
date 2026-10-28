@@ -12,6 +12,9 @@ import hindsight_litellm
 import litellm
 from langchain.agents import AgentState, create_agent
 from langchain.agents.middleware import (
+    AgentMiddleware,
+    ModelRequest,
+    ModelResponse,
     SummarizationMiddleware,
     ToolCallLimitMiddleware,
 )
@@ -20,6 +23,7 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
     convert_to_messages,
     convert_to_openai_messages,
     trim_messages,
@@ -44,7 +48,6 @@ from ncatbot.types import (
 )
 from ncatbot.types.qq import Face, Forward, ForwardNode, Json, Share
 from ncatbot.utils import get_config_manager, get_log
-from openai import max_retries
 
 from .time_controller import (
     TemperatureController,
@@ -67,13 +70,17 @@ class ChatAgentState(AgentState):
 global_limiter = ToolCallLimitMiddleware(run_limit=1)
 
 
+SEND_MESSAGE_TOOL_NAME = "send_message"
 
-@tool("send_message",return_direct=True,description=
-      """向当前群聊发送一条消息。
+
+@tool(
+    "send_message",
+    return_direct=True,
+    description="""向当前群聊发送一条消息。每轮必须调用一次。
       content: 
       reply: true 表示发送；false 表示选择不发送！
-      unlimit_length: 默认状态下会有20字符长度限制，设置为 true 可以取消限制。请保证你的确需要解除消息长度限制。一般而言不建议解除限制，群聊消息不应过长"""
-      )
+      unlimit_length: 默认状态下会有20字符长度限制，设置为 true 可以取消限制。请保证你的确需要解除消息长度限制。一般而言不建议解除限制，群聊消息不应过长""",
+)
 async def send_message_tool(
     content: str,
     reply: bool = False,
@@ -94,9 +101,7 @@ async def send_message_tool(
     elif not content.strip():
         LOG.info("回复内容为空")
     if not reply or not content.strip():
-        plugin.add_context(
-            bot_content="", message=user_msg, user_content=user_content
-        )
+        plugin.add_context(bot_content="", message=user_msg, user_content=user_content)
         return "skipped"
 
     if event is not None:
@@ -105,11 +110,46 @@ async def send_message_tool(
         # 主动说话场景没有 event
         await plugin.api.qq.send_group_text(plugin.target_group_id, content)
     if len(content) > 20 and not unlimit_length:
-        LOG.warning(
-            f"send_message_tool: content 长度 {len(content)} 超过 20"
-        )
+        LOG.warning(f"send_message_tool: content 长度 {len(content)} 超过 20")
     plugin.add_context(bot_content=content, message=user_msg, user_content=user_content)
     return "sent"
+
+
+class ForceSendMessageMiddleware(AgentMiddleware[ChatAgentState, None, Any]):
+    """强制模型每轮都调用 send_message 工具。
+
+    模型有时会直接输出文本而不调用工具，那段文本按设计会被丢弃，
+    结果是这一轮既没发消息也没进历史。这里用 tool_choice 指名工具，
+    让模型必须走工具；不想回复时把 reply 设成 false 即可。
+    """
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[None],
+        handler: Callable[[ModelRequest[None]], Awaitable[ModelResponse[Any]]],
+    ) -> ModelResponse[Any]:
+        try:
+            return await handler(request.override(tool_choice=SEND_MESSAGE_TOOL_NAME))
+        except Exception as e:  # noqa: BLE001 - 后端异常五花八门，一律降级为不强制
+            # 个别后端不支持指名 tool_choice，降级成不强制，交给兜底逻辑处理
+            LOG.warning("强制调用 send_message 失败，降级为不强制：%s", e)
+            return await handler(request.override(tool_choice=None))
+
+
+def _extract_text(content: Any) -> str:
+    """取出消息 content 里的纯文本部分。"""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        return "\n".join(p.strip() for p in parts if p.strip())
+    return ""
+
 
 def _patch_hindsight_run_async() -> None:
     """Monkey patch hindsight_client._run_async to be safe inside a running event loop.
@@ -129,6 +169,7 @@ def _patch_hindsight_run_async() -> None:
             asyncio.set_event_loop(loop)
 
         if loop.is_running():
+
             def _runner():
                 new_loop = asyncio.new_event_loop()
                 try:
@@ -142,20 +183,21 @@ def _patch_hindsight_run_async() -> None:
 
     _hc._run_async = _safe_run_async
 
-SOUL_PROMPT = (Path(__file__).resolve().parent / "SOUL.txt").read_text(
-    encoding="utf-8"
-)
 
-SYSTEM_PROMPT = SOUL_PROMPT + \
-"""
+SOUL_PROMPT = (Path(__file__).resolve().parent / "SOUL.txt").read_text(encoding="utf-8")
+
+SYSTEM_PROMPT = (
+    SOUL_PROMPT
+    + """
 
 GUIDELINES:
 你在一个群聊里面，你收到的消息不一定是发给你的，你需要根据上下文和语境来判断是否回复。
 对于一条消息，<quote>...</quote> 里面的内容是引用的消息，通常是你之前发过的消息或者其他人的消息，你需要根据这些引用来判断当前消息的语境。<forward>...</forward> 里面是合并转发消息的内容，每条前面的名字是转发节点的发送者。user_name : message 是用户发给你的消息, 不同的user_name代表不同的用户,你需要根据这些消息来判断每个用户的意图和情感。
 重要！！！发送消息时，**必须**调用 send_message 工具；任何直接输出的文字都会被**完全丢弃**，不会作为消息内容发送!!!
-你可以自行决定是否调用 send_message 工具，或者直接忽略用户消息。不需要每一条都回复，像人一样选择性回复就行。
+send_message 工具是强制调用的，每轮都必须调用一次；不想回复时把参数 reply 设成 false（content 留空），相当于已读不回。不需要每一条都回复，像人一样选择性回复就行。
 不要输出markdown、代码块、表格、列表等格式化内容，直接输出纯文本即可。
 """
+)
 
 
 # 合并转发可能非常长，解析时限制条数、嵌套层数、图片数和总字符数，避免撑爆上下文
@@ -273,6 +315,7 @@ async def _render_forward(
 
 class AIPlugin(NcatBotPlugin):
     """AI 适配器基础用法示例"""
+
     name = "hello_world_ai"
     hindsight: Any = None
     hindsight_port: int = 7071
@@ -287,10 +330,10 @@ class AIPlugin(NcatBotPlugin):
     _bg_task: asyncio.Task[None] | None = None
     # 上次收到真实用户消息的 monotonic 时间，用于主动说话沉默计时
     _last_user_msg_at: float = 0.0
-    model : str
-    api_key : str
-    base_url : str
-    chat_llm : ChatLiteLLM | None = None
+    model: str
+    api_key: str
+    base_url: str
+    chat_llm: ChatLiteLLM | None = None
     agent: Any = None
     # hindsight 记忆库：群消息按 user_id 分库，主动说话固定用 self
     PROACTIVE_BANK_ID: str = "self"
@@ -314,9 +357,11 @@ class AIPlugin(NcatBotPlugin):
         )
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
-        #self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}")
+        # self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}")
         _patch_hindsight_run_async()
-        hindsight_litellm.configure(hindsight_api_url=f"http://localhost:{self.hindsight_port}")
+        hindsight_litellm.configure(
+            hindsight_api_url=f"http://localhost:{self.hindsight_port}"
+        )
         hindsight_litellm.set_defaults(bank_id="default-bank")  # 设置一个默认值
         hindsight_litellm.enable()
         info = await self.api.qq.query.get_login_info()
@@ -327,7 +372,7 @@ class AIPlugin(NcatBotPlugin):
         self._bg_task = asyncio.create_task(self._proactive_loop())
         manager = get_config_manager()
         ai_entry = manager.get_adapter_config("ai")
-        if ai_entry :
+        if ai_entry:
             self.model = ai_entry.config.get("completion_model", "")
             self.api_key = ai_entry.config.get("api_key", "")
             self.base_url = ai_entry.config.get("base_url", "")
@@ -352,6 +397,8 @@ class AIPlugin(NcatBotPlugin):
                 self.chat_llm,
                 tools=[send_message_tool],
                 middleware=[
+                    # 放最外层：强制每次都调用 send_message 工具
+                    ForceSendMessageMiddleware(),
                     global_limiter,  # type: ignore[arg-type]
                     # 历史接近预算时让 LLM 压缩成摘要，而不是硬截断丢掉。
                     # keep=('messages', 24) 表示压缩后保留最近 24 条原文。
@@ -366,6 +413,7 @@ class AIPlugin(NcatBotPlugin):
                 # 从这里取 plugin / event / user_msg
                 state_schema=ChatAgentState,
             )
+
     def get_now_time(self) -> SystemMessage:
         """获取当前时间，返回 SystemMessage 形式，供 LLM 使用"""
         now = time.localtime()
@@ -433,9 +481,7 @@ class AIPlugin(NcatBotPlugin):
             user_chat_content = prefixed_text
 
         temperature = self.temperature_controller.current_temperature(now)
-        if self.temperature_controller.should_reheat(
-            prefixed_text, temperature, now
-        ):
+        if self.temperature_controller.should_reheat(prefixed_text, temperature, now):
             temperature = self.temperature_controller.reheat(now)
         # 温度 → token 预算，再从历史尾部取能塞进预算的连续片段
         token_budget = self.temperature_controller.temperature_to_token_budget(
@@ -459,7 +505,7 @@ class AIPlugin(NcatBotPlugin):
             start_on="human",
         )
         # self.add_context(
-        #     bot_content="",  
+        #     bot_content="",
         #     message=prefixed_text,
         # ) 以后修改逻辑，send_message 工具里不再 add_context，避免重复 add
         # 每个群成员一个记忆库，和旧的 hindsight_bank_id=uid 行为一致
@@ -471,7 +517,6 @@ class AIPlugin(NcatBotPlugin):
             user_msg=prefixed_text,  # 当前这轮用户消息，供 add_context 用
             user_content=user_chat_content,  # 带图片的版本，历史保留 10 轮
         )
-        
 
     async def _proactive_loop(self) -> None:
         """主动说话心跳：不依赖用户消息。
@@ -584,11 +629,44 @@ class AIPlugin(NcatBotPlugin):
             resp = await self.agent.ainvoke(state, verbose=True)
             last_msg = resp["messages"][-1]
             LOG.info(f"chat response: {last_msg.content}")
+            await self._ensure_send_message(resp, event, user_msg, user_content)
         return resp
 
-    async def _send_to_group(
-        self, event: GroupMessageEvent, content: str
+    async def _ensure_send_message(
+        self,
+        resp: Any,
+        event: Any,
+        user_msg: str,
+        user_content: Any,
     ) -> None:
+        """兜底：模型没调用 send_message 时补一次调用。
+
+        强制工具调用在个别后端会失效，模型可能只输出文本。
+        按设计，直接输出的文本不算回复、不发送，这里只补一次
+        「沉默」调用，保证这一轮仍然进历史。
+        """
+        messages = resp.get("messages", []) if isinstance(resp, dict) else []
+        if any(
+            isinstance(msg, ToolMessage) and msg.name == SEND_MESSAGE_TOOL_NAME
+            for msg in messages
+        ):
+            return
+        if not user_msg:
+            # 主动说话没有用户消息，补一次沉默调用没有意义
+            return
+        LOG.info("模型未调用 send_message，补一次沉默调用")
+        await send_message_tool.ainvoke(
+            {
+                "content": "",
+                "reply": False,
+                "plugin": self,
+                "event": event,
+                "user_msg": user_msg,
+                "user_content": user_content,
+            }
+        )
+
+    async def _send_to_group(self, event: GroupMessageEvent, content: str) -> None:
         """向当前群聊发送一条消息。"""
         if not content.strip():
             return
@@ -598,6 +676,7 @@ class AIPlugin(NcatBotPlugin):
                 continue
             await self.api.qq.send_group_text(event.group_id, msg)
             await asyncio.sleep(1)  # 避免发太快
+
     def is_target_group(self, group_id: int | str) -> bool:
         """检查消息是否来自目标群聊。"""
         return str(group_id) == str(self.target_group_id)
@@ -658,19 +737,7 @@ class AIPlugin(NcatBotPlugin):
     @staticmethod
     def _has_round_text(content: Any) -> bool:
         """判断消息内容里是否有实际文字，空的主动说话轮次不计数。"""
-        if isinstance(content, str):
-            return bool(content.strip())
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, str) and part.strip():
-                    return True
-                if (
-                    isinstance(part, dict)
-                    and part.get("type") == "text"
-                    and str(part.get("text", "")).strip()
-                ):
-                    return True
-        return False
+        return bool(_extract_text(content))
 
     def _prune_history_images(self) -> None:
         """只保留最近 N 轮用户消息里的图片，更早的图片降级为 [图片] 占位。"""
@@ -696,7 +763,7 @@ class AIPlugin(NcatBotPlugin):
     async def get_user_name(self, user_id: int | str) -> str:
         """查询用户在该群的显示名，优先群昵称，回退到 QQ 昵称"""
         try:
-            if(user_id == "all"):
+            if user_id == "all":
                 return "全体成员"
             member_info = await self.api.qq.query.get_group_member_info(
                 self.target_group_id, user_id
@@ -756,8 +823,7 @@ class AIPlugin(NcatBotPlugin):
         messages: MessageArray,
         message_id: str | int | None = None,
     ) -> tuple[str, Sequence[dict[str, Any]]]:
-        """把 MessageArray 拆成 (纯文本, 多模态 parts)。
-        """
+        """把 MessageArray 拆成 (纯文本, 多模态 parts)。"""
         text_buf: list[str] = []
 
         # 处理 Reply：作为纯文本 quote 块塞到消息开头
@@ -775,9 +841,7 @@ class AIPlugin(NcatBotPlugin):
                     name = await self.get_user_name(message_data.sender.user_id)
                 else:
                     name = "未知用户"
-                quoted = MessageArray.from_list(
-                    message_data.message or []
-                ).text
+                quoted = MessageArray.from_list(message_data.message or []).text
                 quote_lines.append(f"{name}：{quoted}")
             quote_lines.append("</quote>")
             text_buf.append("\n".join(quote_lines) + "\n")
@@ -838,9 +902,7 @@ class AIPlugin(NcatBotPlugin):
 
         text_only = "".join(text_buf)
         # 若没有任何 image_url 段，多模态 parts 没意义，调用方会走纯文本分支
-        has_image_part = any(
-            p.get("type") == "image_url" for p in multimodal_parts
-        )
+        has_image_part = any(p.get("type") == "image_url" for p in multimodal_parts)
         if not has_image_part:
             multimodal_parts = []
         return text_only, multimodal_parts

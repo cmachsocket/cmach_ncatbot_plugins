@@ -6,7 +6,6 @@ from ncatbot.plugin import NcatBotPlugin
 
 
 class CmachSocketPlugin(NcatBotPlugin):
-
     async def on_load(self):
         self.logger.info(f"{self.name} 已加载")
 

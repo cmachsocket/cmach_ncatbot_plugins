@@ -60,23 +60,26 @@ $T(t') = T_{\min} + (T_{\text{base}} - T_{\min})
 import math
 import time
 
-T0 = 1.0          # 初始温度
-T_min = 0.05      # 最低温度
-tau = 1800        # 30 分钟衰减到约 1/e
-gamma = 4.0       # 重加热倍数
+T0 = 1.0  # 初始温度
+T_min = 0.05  # 最低温度
+tau = 1800  # 30 分钟衰减到约 1/e
+gamma = 4.0  # 重加热倍数
 
 T_base = T0
 t_base = time.monotonic()
 
+
 def current_T():
     dt = time.monotonic() - t_base
     return T_min + (T_base - T_min) * math.exp(-dt / tau)
+
 
 def T_to_budget(T):
     # 对数映射到 token 预算区间 [budget_min, budget_max]
     p = (math.log(T) - math.log(T_min)) / (math.log(T0) - math.log(T_min))
     p = max(0.0, min(1.0, p))
     return int(budget_min + p * (budget_max - budget_min))
+
 
 def on_dialog_turn(query):
     global T_base, t_base

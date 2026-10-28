@@ -11,6 +11,7 @@ DEFAULT_TOKEN_BASE = 4096
 DEFAULT_MULTIPLIER_MIN = 0.5
 DEFAULT_MULTIPLIER_MAX = 1.5
 
+
 class TemperatureController:
     """按真实时间控制温度、上下文 token 预算和重加热。"""
 
@@ -72,9 +73,7 @@ class TemperatureController:
 
     def _save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = self.state_path.with_suffix(
-            self.state_path.suffix + ".tmp"
-        )
+        temporary_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         state = {
             "saved_at": time.time(),
             "temperature_base": self.temperature_base,

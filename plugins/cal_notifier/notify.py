@@ -62,8 +62,8 @@ class NotifyPlugin(NcatBotPlugin):
     caldav_password: str
     davclient: aio.AsyncDAVClient
     scheduler: AsyncIOScheduler
-    sync_tokens: dict[str, str]   # {calendar_url: sync_token}
-    snapshot: dict[str, str]      # {对象绝对URL: uid}
+    sync_tokens: dict[str, str]  # {calendar_url: sync_token}
+    snapshot: dict[str, str]  # {对象绝对URL: uid}
     target_id: int
     notify_before_minutes: int
     notify_window_days: int
@@ -79,7 +79,9 @@ class NotifyPlugin(NcatBotPlugin):
         self.caldav_user = self.config.get("CALDAV_USER", "your_username")
         self.caldav_password = self.config.get("CALDAV_PASSWORD", "your_password")
         self.target_id = int(self.config.get("target_id", 0))
-        self.notify_before_minutes = max(0, int(self.config.get("notify_before_minutes", 10)))
+        self.notify_before_minutes = max(
+            0, int(self.config.get("notify_before_minutes", 10))
+        )
         self.notify_window_days = max(1, int(self.config.get("notify_window_days", 30)))
         self.all_day_notify_hour = int(
             self.config.get("all_day_notify_hour", DEFAULT_ALL_DAY_NOTIFY_HOUR)
@@ -87,7 +89,9 @@ class NotifyPlugin(NcatBotPlugin):
         self.all_day_notify_minute = int(
             self.config.get("all_day_notify_minute", DEFAULT_ALL_DAY_NOTIFY_MINUTE)
         )
-        self.tz = self._resolve_timezone(str(self.config.get("timezone", DEFAULT_TIMEZONE)))
+        self.tz = self._resolve_timezone(
+            str(self.config.get("timezone", DEFAULT_TIMEZONE))
+        )
         self._jobs_by_uid = {}
         # 手动 /sync_cal 与定时轮询共用这把锁，避免两者交错重排作业
         self._sync_lock = asyncio.Lock()
@@ -109,10 +113,11 @@ class NotifyPlugin(NcatBotPlugin):
             timezone=self.tz,
             jobstores=self._build_jobstores(),
             job_defaults={
-                'coalesce': True,          # 合并错过的运行
-                'max_instances': 1,        # 同一任务最大并发实例数
-                'misfire_grace_time': 300,  # 允许延迟执行的秒数
-            })
+                "coalesce": True,  # 合并错过的运行
+                "max_instances": 1,  # 同一任务最大并发实例数
+                "misfire_grace_time": 300,  # 允许延迟执行的秒数
+            },
+        )
         self.scheduler.add_job(
             self._scheduled_poll,
             trigger=IntervalTrigger(minutes=POLL_INTERVAL_MINUTES),
@@ -130,7 +135,7 @@ class NotifyPlugin(NcatBotPlugin):
     def _resolve_timezone(self, name: str) -> ZoneInfo:
         try:
             return ZoneInfo(name)
-        except (KeyError, ValueError):
+        except KeyError, ValueError:
             self.logger.warning(f"时区 {name} 不可用，回退到 {DEFAULT_TIMEZONE}")
             return ZoneInfo(DEFAULT_TIMEZONE)
 
@@ -171,7 +176,7 @@ class NotifyPlugin(NcatBotPlugin):
             collection: SynchronizableCalendarObjectCollection = (
                 await calendar._async_get_objects_by_sync_token(
                     sync_token=old_token,
-                    load_objects=True,       # 需要完整 iCal 数据
+                    load_objects=True,  # 需要完整 iCal 数据
                 )
             )
             # 保存新 token（首次调用 old_token=None，会全量返回并给初始 token）
@@ -185,8 +190,11 @@ class NotifyPlugin(NcatBotPlugin):
                 # 快照存 {href: uid}，删除时用于反查需要取消的作业
                 if obj.data is None:
                     changes.append(
-                        Change(href=href, kind=ChangeKind.DELETED,
-                            uid=self.snapshot.pop(href, ""))
+                        Change(
+                            href=href,
+                            kind=ChangeKind.DELETED,
+                            uid=self.snapshot.pop(href, ""),
+                        )
                     )
                     continue
 
@@ -198,9 +206,7 @@ class NotifyPlugin(NcatBotPlugin):
                 kind = ChangeKind.UPDATED if href in self.snapshot else ChangeKind.ADDED
                 uid = str(obj.icalendar_component.get("UID") or "")
                 self.snapshot[href] = uid
-                changes.append(
-                    Change(href=href, kind=kind, calendar=cal, uid=uid)
-                )
+                changes.append(Change(href=href, kind=kind, calendar=cal, uid=uid))
 
             # 全量同步不返回删除条目：拿"本次拉到的集合"和快照对账，
             # 否则上一轮之后被删掉的事件会带着已排的作业一直留着。
@@ -210,8 +216,11 @@ class NotifyPlugin(NcatBotPlugin):
                     if href in seen:
                         continue
                     changes.append(
-                        Change(href=href, kind=ChangeKind.DELETED,
-                            uid=self.snapshot.pop(href, ""))
+                        Change(
+                            href=href,
+                            kind=ChangeKind.DELETED,
+                            uid=self.snapshot.pop(href, ""),
+                        )
                     )
         return changes
 
@@ -247,13 +256,13 @@ class NotifyPlugin(NcatBotPlugin):
             if start.tzinfo is None:
                 start = start.replace(tzinfo=self.tz)
             if start <= now:
-                return                      # 已经开始了，不补发
+                return  # 已经开始了，不补发
             notify_at = start - timedelta(minutes=self.notify_before_minutes)
             all_day = False
         elif isinstance(raw, date):
             # 全天事件：前一天 all_day_notify_hour:minute 提醒
             if raw < now.date():
-                return                      # 已经过去了，不补发
+                return  # 已经过去了，不补发
             start = datetime.combine(raw, time.min, tzinfo=self.tz)
             notify_at = (start - timedelta(days=1)).replace(
                 hour=self.all_day_notify_hour, minute=self.all_day_notify_minute
@@ -299,7 +308,9 @@ class NotifyPlugin(NcatBotPlugin):
 
             try:
                 # 用完整 Calendar 展开，自动处理 RRULE / EXDATE / 覆盖实例
-                occurrences = recurring_ical_events.of(change.calendar).between(now, horizon)
+                occurrences = recurring_ical_events.of(change.calendar).between(
+                    now, horizon
+                )
             except (KeyError, TypeError, ValueError) as exc:
                 self.logger.warning(f"展开事件失败 {change.href}: {exc}")
                 continue
@@ -375,8 +386,12 @@ class NotifyPlugin(NcatBotPlugin):
             except TimeoutError:
                 # CalDAV 服务器卡住：给个回执，别让命令石沉大海。
                 # 锁已随 async with 释放，后续指令仍可用。
-                self.logger.error(f"{SYNC_COMMAND} 同步超时（>{SYNC_TIMEOUT_SECONDS}s）")
-                await event.reply(text=f"同步超时（>{SYNC_TIMEOUT_SECONDS}s），详见日志。")
+                self.logger.error(
+                    f"{SYNC_COMMAND} 同步超时（>{SYNC_TIMEOUT_SECONDS}s）"
+                )
+                await event.reply(
+                    text=f"同步超时（>{SYNC_TIMEOUT_SECONDS}s），详见日志。"
+                )
                 return
             except (OSError, RuntimeError, ValueError) as exc:
                 self.logger.error(f"{SYNC_COMMAND} 同步异常: {exc}")
@@ -386,9 +401,7 @@ class NotifyPlugin(NcatBotPlugin):
         if count < 0:
             await event.reply(text="同步失败，详见日志。")
             return
-        await event.reply(
-            text=f"同步完成：{count} 条变更，当前待发提醒 {jobs} 条。"
-        )
+        await event.reply(text=f"同步完成：{count} 条变更，当前待发提醒 {jobs} 条。")
 
     # 只挂私聊。用 registrar.qq.* 而不是顶层 registrar.on_private_command：
     # 后者 platform 默认 None，不会挂 PlatformFilter，命令会在其它平台的

@@ -1,12 +1,28 @@
 """chat_bot 插件的上下文、多模态解析和工具测试。"""
 
 import asyncio
+from collections.abc import Callable, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain.agents import create_agent
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.language_models import LanguageModelInput
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import Runnable
+from langchain_core.tools import BaseTool
 from ncatbot.types import MessageArray
+from pydantic import Field
 
 from plugins.chat_bot import chat_bot as chat_module
 
@@ -543,6 +559,169 @@ def test_send_message_tool_allows_long_reply_when_unlimited(caplog) -> None:
     assert "超过 20" not in caplog.text
 
 
+# ---------- 强制调用 send_message ----------
+
+
+def _model_request() -> Any:
+    return chat_module.ModelRequest(
+        model=GenericFakeChatModel(messages=iter([AIMessage(content="hi")])),
+        messages=[],
+    )
+
+
+def test_force_send_message_middleware_forces_tool_choice() -> None:
+    seen: list[Any] = []
+
+    async def handler(request: Any) -> Any:
+        seen.append(request.tool_choice)
+        return chat_module.ModelResponse(result=[AIMessage(content="ok")])
+
+    middleware = chat_module.ForceSendMessageMiddleware()
+
+    result = asyncio.run(middleware.awrap_model_call(_model_request(), handler))
+
+    assert seen == ["send_message"]
+    assert result.result[0].content == "ok"
+
+
+def test_force_send_message_middleware_degrades_when_backend_rejects_choice(
+    caplog,
+) -> None:
+    seen: list[Any] = []
+
+    async def handler(request: Any) -> Any:
+        seen.append(request.tool_choice)
+        if request.tool_choice == "send_message":
+            raise RuntimeError("backend rejects named tool_choice")
+        return chat_module.ModelResponse(result=[AIMessage(content="ok")])
+
+    middleware = chat_module.ForceSendMessageMiddleware()
+
+    with caplog.at_level("WARNING"):
+        result = asyncio.run(middleware.awrap_model_call(_model_request(), handler))
+
+    assert seen == ["send_message", None]
+    assert result.result[0].content == "ok"
+    assert "降级为不强制" in caplog.text
+
+
+def test_ensure_send_message_records_silence_when_tool_not_called() -> None:
+    plugin = _plugin()
+    resp = {"messages": [AIMessage(content="直接输出的文本")]}
+
+    asyncio.run(
+        plugin._ensure_send_message(
+            resp, SimpleNamespace(group_id=555), "Alice: hi", None
+        )
+    )
+
+    # 直接输出的文本按设计不发送，只补一次沉默调用让这轮进历史
+    assert plugin.api.qq.texts == []  # type: ignore[union-attr]
+    assert plugin.assistent_messages[-1].content == "...（已读未回）"
+
+
+def test_ensure_send_message_skips_when_tool_already_called() -> None:
+    plugin = _plugin()
+    resp = {
+        "messages": [
+            AIMessage(content="x"),
+            ToolMessage(content="sent", tool_call_id="1", name="send_message"),
+        ]
+    }
+
+    asyncio.run(
+        plugin._ensure_send_message(
+            resp, SimpleNamespace(group_id=555), "Alice: hi", None
+        )
+    )
+
+    assert plugin.api.qq.texts == []  # type: ignore[union-attr]
+    assert plugin.assistent_messages == []
+
+
+def test_ensure_send_message_skips_proactive_mode() -> None:
+    plugin = _plugin()
+    resp = {"messages": [AIMessage(content="x")]}
+
+    asyncio.run(plugin._ensure_send_message(resp, None, "", None))
+
+    assert plugin.api.qq.texts == []  # type: ignore[union-attr]
+    assert plugin.assistent_messages == []
+
+
+class _ScriptedChatModel(BaseChatModel):
+    """按剧本返回消息，并记录 bind_tools 收到的 tool_choice。"""
+
+    script: list[AIMessage] = Field(default_factory=list)
+    seen_tool_choice: list[Any] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted"
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        return ChatResult(generations=[ChatGeneration(message=self.script.pop(0))])
+
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, AIMessage]:
+        self.seen_tool_choice.append(tool_choice)
+        return self.bind(tools=tools, tool_choice=tool_choice, **kwargs)
+
+
+def test_agent_binds_send_message_with_forced_tool_choice(monkeypatch) -> None:
+    plugin = _plugin()
+    model = _ScriptedChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "send_message",
+                        "args": {"content": "回复", "reply": True},
+                        "id": "call_1",
+                    }
+                ],
+            )
+        ]
+    )
+    plugin.agent = create_agent(
+        model,
+        tools=[chat_module.send_message_tool],
+        middleware=[chat_module.ForceSendMessageMiddleware()],
+        state_schema=chat_module.ChatAgentState,
+    )
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(chat_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(
+        plugin._run_agent(
+            [HumanMessage(content="hi")],
+            bank_id="u",
+            event=SimpleNamespace(group_id=555),
+            user_msg="Alice: hi",
+        )
+    )
+
+    # 模型被强制绑定到 send_message 工具，消息也真的发出去了
+    assert model.seen_tool_choice == ["send_message"]
+    assert plugin.api.qq.texts == [(555, "回复")]  # type: ignore[union-attr]
+    assert plugin.assistent_messages[-1].content == "回复"
+
+
 def test_send_to_group_sends_non_empty_lines(monkeypatch) -> None:
     plugin = _plugin()
 
@@ -627,6 +806,8 @@ def test_run_agent_passes_state_and_returns_response() -> None:
     assert agent.state["user_msg"] == "Alice: hi"
     assert len(agent.state["messages"]) == 1
     assert plugin.chat_llm.model_kwargs["hindsight_bank_id"] == "user-1"  # type: ignore[union-attr]
+    # 模型没调用 send_message：补一次沉默调用，这轮仍然进历史
+    assert plugin.assistent_messages[-1].content == "...（已读未回）"
 
 
 def test_count_tokens_requires_model() -> None:
