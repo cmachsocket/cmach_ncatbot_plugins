@@ -72,6 +72,12 @@ global_limiter = ToolCallLimitMiddleware(run_limit=1)
 
 SEND_MESSAGE_TOOL_NAME = "send_message"
 
+# 强制调用工具的力度阶梯，从强到弱；后端不认当前写法就降一档重试。
+# 1) 指名 send_message：OpenAI 系支持
+# 2) "required"：只要求必须调工具，agent 里只有 send_message 一个工具，效果等价
+# 3) None：不强制，交给提示词和兜底逻辑
+_FORCE_TOOL_CHOICES: tuple[Any, ...] = (SEND_MESSAGE_TOOL_NAME, "required", None)
+
 
 @tool(
     "send_message",
@@ -121,19 +127,43 @@ class ForceSendMessageMiddleware(AgentMiddleware[ChatAgentState, None, Any]):
     模型有时会直接输出文本而不调用工具，那段文本按设计会被丢弃，
     结果是这一轮既没发消息也没进历史。这里用 tool_choice 指名工具，
     让模型必须走工具；不想回复时把 reply 设成 false 即可。
+
+    后端对 tool_choice 的支持程度并不一致：OpenAI 系支持指名某个工具，
+    一些兼容接口只认 "required"，还有的根本不收这个字段（带上会返回
+    400 invalid arguments）。所以这里按阶梯降级：指名 → required → 不强制，
+    哪一档能用就记住哪一档，之后不再重复去试那些会被拒的写法。
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # 当前用的阶梯档位，见 _FORCE_TOOL_CHOICES
+        self.level = 0
 
     async def awrap_model_call(
         self,
         request: ModelRequest[None],
         handler: Callable[[ModelRequest[None]], Awaitable[ModelResponse[Any]]],
     ) -> ModelResponse[Any]:
-        try:
-            return await handler(request.override(tool_choice=SEND_MESSAGE_TOOL_NAME))
-        except Exception as e:  # noqa: BLE001 - 后端异常五花八门，一律降级为不强制
-            # 个别后端不支持指名 tool_choice，降级成不强制，交给兜底逻辑处理
-            LOG.warning("强制调用 send_message 失败，降级为不强制：%s", e)
-            return await handler(request.override(tool_choice=None))
+        while True:
+            choice = _FORCE_TOOL_CHOICES[self.level]
+            try:
+                response = await handler(request.override(tool_choice=choice))
+            except Exception as e:
+                # 后端异常五花八门，一律降级重试
+                if self.level >= len(_FORCE_TOOL_CHOICES) - 1:
+                    # 已经不强制了还是失败，说明不是强制的问题，原样抛出
+                    raise
+                LOG.warning(
+                    "强制调用 send_message 失败（tool_choice=%r），降级重试：%s",
+                    choice,
+                    e,
+                )
+                self.level += 1
+                continue
+            if choice is None and self.level:
+                # 前面的写法都被拒，说明这个后端根本不收 tool_choice
+                LOG.warning("该后端不接受 tool_choice，之后不再强制调用 send_message")
+            return response
 
 
 def _extract_text(content: Any) -> str:
@@ -335,6 +365,8 @@ class AIPlugin(NcatBotPlugin):
     base_url: str
     chat_llm: ChatLiteLLM | None = None
     agent: Any = None
+    # 强制调用 send_message 的中间件，记住后端能接受哪种 tool_choice 写法
+    force_middleware: ForceSendMessageMiddleware | None = None
     # hindsight 记忆库：群消息按 user_id 分库，主动说话固定用 self
     PROACTIVE_BANK_ID: str = "self"
     # 共用同一个 chat_llm，切 bank_id 时要串行，避免并发调用互相污染
@@ -393,12 +425,14 @@ class AIPlugin(NcatBotPlugin):
             # ToolCallLimitState，与 AgentState 子类在类型上无法共存
             # （不变量冲突）。运行时 create_agent 只读 state_schema，
             # 不校验 middleware 的 StateT，所以行为是正确的。
+            # 强制档位会记住后端能接受哪种写法，所以这个实例要复用，不能每次新建
+            self.force_middleware = ForceSendMessageMiddleware()
             self.agent = create_agent(
                 self.chat_llm,
                 tools=[send_message_tool],
                 middleware=[
                     # 放最外层：强制每次都调用 send_message 工具
-                    ForceSendMessageMiddleware(),
+                    self.force_middleware,
                     global_limiter,  # type: ignore[arg-type]
                     # 历史接近预算时让 LLM 压缩成摘要，而不是硬截断丢掉。
                     # keep=('messages', 24) 表示压缩后保留最近 24 条原文。

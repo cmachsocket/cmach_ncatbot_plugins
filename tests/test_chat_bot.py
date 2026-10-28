@@ -600,9 +600,67 @@ def test_force_send_message_middleware_degrades_when_backend_rejects_choice(
     with caplog.at_level("WARNING"):
         result = asyncio.run(middleware.awrap_model_call(_model_request(), handler))
 
-    assert seen == ["send_message", None]
+    # 指名不被接受就退到 required（agent 只有一个工具，效果等价）
+    assert seen == ["send_message", "required"]
     assert result.result[0].content == "ok"
-    assert "降级为不强制" in caplog.text
+    assert "降级重试" in caplog.text
+
+
+def test_force_send_message_middleware_falls_back_to_no_choice(caplog) -> None:
+    """后端完全不收 tool_choice 时，一路降到不强制。"""
+    seen: list[Any] = []
+
+    async def handler(request: Any) -> Any:
+        seen.append(request.tool_choice)
+        if request.tool_choice is not None:
+            raise RuntimeError("backend rejects tool_choice")
+        return chat_module.ModelResponse(result=[AIMessage(content="ok")])
+
+    middleware = chat_module.ForceSendMessageMiddleware()
+
+    with caplog.at_level("WARNING"):
+        result = asyncio.run(middleware.awrap_model_call(_model_request(), handler))
+
+    assert seen == ["send_message", "required", None]
+    assert result.result[0].content == "ok"
+    assert "不再强制调用 send_message" in caplog.text
+
+
+def test_force_send_message_middleware_remembers_degraded_level() -> None:
+    """记住后端能接受的写法，之后不再重复去试会被拒的那一档。"""
+    seen: list[Any] = []
+
+    async def handler(request: Any) -> Any:
+        seen.append(request.tool_choice)
+        if request.tool_choice is not None:
+            raise RuntimeError("backend rejects tool_choice")
+        return chat_module.ModelResponse(result=[AIMessage(content="ok")])
+
+    middleware = chat_module.ForceSendMessageMiddleware()
+
+    for _ in range(3):
+        asyncio.run(middleware.awrap_model_call(_model_request(), handler))
+
+    # 第一轮降了三档，之后都直接用不强制
+    assert seen == [
+        "send_message",
+        "required",
+        None,
+        None,
+        None,
+    ]
+
+
+def test_force_send_message_middleware_reraises_when_unforced_also_fails() -> None:
+    """连不强制都失败，说明不是强制的问题，原样抛出。"""
+
+    async def handler(request: Any) -> Any:
+        raise RuntimeError("backend is down")
+
+    middleware = chat_module.ForceSendMessageMiddleware()
+
+    with pytest.raises(RuntimeError, match="backend is down"):
+        asyncio.run(middleware.awrap_model_call(_model_request(), handler))
 
 
 def test_ensure_send_message_records_silence_when_tool_not_called() -> None:
@@ -720,6 +778,70 @@ def test_agent_binds_send_message_with_forced_tool_choice(monkeypatch) -> None:
     assert model.seen_tool_choice == ["send_message"]
     assert plugin.api.qq.texts == [(555, "回复")]  # type: ignore[union-attr]
     assert plugin.assistent_messages[-1].content == "回复"
+
+
+class _NamedChoiceRejectingChatModel(_ScriptedChatModel):
+    """拒绝指名工具的后端，只认 required。"""
+
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Runnable[LanguageModelInput, AIMessage]:
+        self.seen_tool_choice.append(tool_choice)
+        if tool_choice == "send_message":
+            raise RuntimeError("backend rejects named tool_choice")
+        return self.bind(tools=tools, tool_choice=tool_choice, **kwargs)
+
+
+def test_agent_degrades_to_required_when_named_tool_choice_rejected(
+    monkeypatch,
+) -> None:
+    plugin = _plugin()
+    model = _NamedChoiceRejectingChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "send_message",
+                        "args": {"content": "回复", "reply": True},
+                        "id": "call_1",
+                    }
+                ],
+            )
+        ]
+    )
+    middleware = chat_module.ForceSendMessageMiddleware()
+    plugin.agent = create_agent(
+        model,
+        tools=[chat_module.send_message_tool],
+        middleware=[middleware],
+        state_schema=chat_module.ChatAgentState,
+    )
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(chat_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(
+        plugin._run_agent(
+            [HumanMessage(content="hi")],
+            bank_id="u",
+            event=SimpleNamespace(group_id=555),
+            user_msg="Alice: hi",
+        )
+    )
+
+    # 指名被拒后退到 required，这一轮照样把消息发出去
+    assert model.seen_tool_choice == ["send_message", "required"]
+    assert plugin.api.qq.texts == [(555, "回复")]  # type: ignore[union-attr]
+    assert plugin.assistent_messages[-1].content == "回复"
+    # 记住这一档，后面不再去试会被拒的指名
+    assert middleware.level == 1
 
 
 def test_send_to_group_sends_non_empty_lines(monkeypatch) -> None:
