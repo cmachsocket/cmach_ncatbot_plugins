@@ -66,11 +66,6 @@ class ChatAgentState(AgentState):
     user_content: NotRequired[Any]
 
 
-# middleware 的泛型参数填 ChatAgentState，这样它们和 state_schema 一致，
-# 否则 ToolCallLimitMiddleware 会去要自己的 ToolCallLimitState。
-global_limiter = ToolCallLimitMiddleware(run_limit=1)
-
-
 SEND_MESSAGE_TOOL_NAME = "send_message"
 
 # 强制调用工具的力度阶梯，从强到弱；后端不认当前写法就降一档重试。
@@ -78,6 +73,13 @@ SEND_MESSAGE_TOOL_NAME = "send_message"
 # 2) "required"：只要求必须调工具，agent 里只有 send_message 一个工具，效果等价
 # 3) None：不强制，交给提示词和兜底逻辑
 _FORCE_TOOL_CHOICES: tuple[Any, ...] = (SEND_MESSAGE_TOOL_NAME, "required", None)
+# 有额外工具（如 exa 搜索）时不能指名 send_message：指名等于把模型锁死在这一个
+# 工具上，搜索工具永远轮不到。改成只要求必须调用某个工具，由模型自己选。
+_FORCE_TOOL_CHOICES_WITH_TOOLS: tuple[Any, ...] = ("required", None)
+
+# 有额外工具时一轮里允许的工具调用总数，留出「先搜索、再发送」的余量。
+# 没有额外工具时不加这个限制，只靠 send_message 的单轮上限。
+_MAX_TOOL_CALLS_PER_RUN = 5
 
 
 @tool(
@@ -133,10 +135,14 @@ class ForceSendMessageMiddleware(AgentMiddleware[ChatAgentState, None, Any]):
     一些兼容接口只认 "required"，还有的根本不收这个字段（带上会返回
     400 invalid arguments）。所以这里按阶梯降级：指名 → required → 不强制，
     哪一档能用就记住哪一档，之后不再重复去试那些会被拒的写法。
+
+    有额外工具时传 _FORCE_TOOL_CHOICES_WITH_TOOLS：指名 send_message 会让
+    模型没法调用其它工具，那一档不能要。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, choices: Sequence[Any] = _FORCE_TOOL_CHOICES) -> None:
         super().__init__()
+        self.choices = tuple(choices)
         # 当前用的阶梯档位，见 _FORCE_TOOL_CHOICES
         self.level = 0
 
@@ -146,12 +152,12 @@ class ForceSendMessageMiddleware(AgentMiddleware[ChatAgentState, None, Any]):
         handler: Callable[[ModelRequest[None]], Awaitable[ModelResponse[Any]]],
     ) -> ModelResponse[Any]:
         while True:
-            choice = _FORCE_TOOL_CHOICES[self.level]
+            choice = self.choices[self.level]
             try:
                 response = await handler(request.override(tool_choice=choice))
             except Exception as e:
                 # 后端异常五花八门，一律降级重试
-                if self.level >= len(_FORCE_TOOL_CHOICES) - 1:
+                if self.level >= len(self.choices) - 1:
                     # 已经不强制了还是失败，说明不是强制的问题，原样抛出
                     raise
                 LOG.warning(
@@ -229,6 +235,11 @@ send_message 工具是强制调用的，每轮都必须调用一次；不想回�
 不要输出markdown、代码块、表格、列表等格式化内容，直接输出纯文本即可。
 """
 )
+
+# 配了 MCP 搜索工具时才追加，告诉模型可以先搜索再回复
+SEARCH_HINT = """
+[能力] 你还可以调用搜索工具查询实时信息。需要时先搜索，拿到结果后再调用 send_message 回复。
+"""
 
 
 # 合并转发可能非常长，解析时限制条数、嵌套层数、图片数和总字符数，避免撑爆上下文
@@ -366,9 +377,12 @@ class AIPlugin(NcatBotPlugin):
     base_url: str
     mcp_client: MultiServerMCPClient | None = None
     exa_key: str = ""
+    # MCP 搜索工具。on_load 里一定会赋值（没配 key 就是空列表）
     tools: list[BaseTool]
     chat_llm: ChatLiteLLM | None = None
     agent: Any = None
+    # 实际使用的系统提示词，on_load 时按有没有搜索工具拼出来
+    system_prompt: str = SYSTEM_PROMPT
     # 强制调用 send_message 的中间件，记住后端能接受哪种 tool_choice 写法
     force_middleware: ForceSendMessageMiddleware | None = None
     # hindsight 记忆库：群消息按 user_id 分库，主动说话固定用 self
@@ -394,7 +408,7 @@ class AIPlugin(NcatBotPlugin):
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
         self.exa_key = self.get_config("EXA_API_KEY", "")
-        
+
         # self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}")
         _patch_hindsight_run_async()
         hindsight_litellm.configure(
@@ -410,21 +424,14 @@ class AIPlugin(NcatBotPlugin):
         self._bg_task = asyncio.create_task(self._proactive_loop())
         manager = get_config_manager()
         ai_entry = manager.get_adapter_config("ai")
-        if self.exa_key:
-            self.mcp_client = MultiServerMCPClient(
-                {
-                    "exa": {
-                        "url": f"https://mcp.exa.ai/mcp?exaApiKey={self.exa_key}",
-                        "transport": "streamable_http",
-                    }
-                }
-            )
-            self.tools = await self.mcp_client.get_tools()
+        # 必须先赋值：下面无论有没有 MCP 工具都要展开 self.tools
+        self.tools = await self._load_mcp_tools()
+        self.system_prompt = SYSTEM_PROMPT + (SEARCH_HINT if self.tools else "")
         if ai_entry:
             self.model = ai_entry.config.get("completion_model", "")
             self.api_key = ai_entry.config.get("api_key", "")
             self.base_url = ai_entry.config.get("base_url", "")
-           
+
             self.chat_llm = ChatLiteLLM(
                 model=self.model,
                 api_key=self.api_key,
@@ -442,28 +449,85 @@ class AIPlugin(NcatBotPlugin):
             # ToolCallLimitState，与 AgentState 子类在类型上无法共存
             # （不变量冲突）。运行时 create_agent 只读 state_schema，
             # 不校验 middleware 的 StateT，所以行为是正确的。
+            # 有额外工具时不能指名 send_message，否则搜索工具永远调不到
+            self.force_middleware = ForceSendMessageMiddleware(
+                _FORCE_TOOL_CHOICES_WITH_TOOLS if self.tools else _FORCE_TOOL_CHOICES
+            )
             # 强制档位会记住后端能接受哪种写法，所以这个实例要复用，不能每次新建
-            self.force_middleware = ForceSendMessageMiddleware()
+            limiters: list[Any] = [
+                # 每轮最多发一条消息；超了直接结束本轮，避免模型被强制反复调用
+                ToolCallLimitMiddleware(
+                    tool_name=SEND_MESSAGE_TOOL_NAME,
+                    run_limit=1,
+                    exit_behavior="end",
+                ),
+            ]
+            if self.tools:
+                # 搜索会占用调用次数，总次数放宽，留出「先搜索、再发送」的余量
+                limiters.append(
+                    ToolCallLimitMiddleware(
+                        run_limit=_MAX_TOOL_CALLS_PER_RUN,
+                        exit_behavior="end",
+                    )
+                )
+            LOG.info(
+                "agent 工具: %s（强制档位 %r）",
+                [t.name for t in (send_message_tool, *self.tools)],
+                self.force_middleware.choices,
+            )
+            # middleware 列表整体标成 list[Any]：AgentMiddleware 的 StateT 是不变量，
+            # ChatAgentState / ToolCallLimitState 在类型上无法共存（运行时只读
+            # state_schema，不校验 middleware 的 StateT，行为是正确的）。
+            middleware_list: list[Any] = [
+                # 放最外层：强制每次都调用 send_message 工具
+                self.force_middleware,
+                *limiters,
+                # 历史接近预算时让 LLM 压缩成摘要，而不是硬截断丢掉。
+                # keep=('messages', 24) 表示压缩后保留最近 24 条原文。
+                SummarizationMiddleware(
+                    self.chat_llm,
+                    trigger=("tokens", self.context_budget),
+                    keep=("messages", 24),
+                    token_counter=self._count_tokens,
+                ),
+            ]
             self.agent = create_agent(
                 self.chat_llm,
                 tools=[send_message_tool, *self.tools],
-                middleware=[
-                    # 放最外层：强制每次都调用 send_message 工具
-                    self.force_middleware,
-                    global_limiter,  # type: ignore[arg-type]
-                    # 历史接近预算时让 LLM 压缩成摘要，而不是硬截断丢掉。
-                    # keep=('messages', 24) 表示压缩后保留最近 24 条原文。
-                    SummarizationMiddleware(
-                        self.chat_llm,
-                        trigger=("tokens", self.context_budget),
-                        keep=("messages", 24),
-                        token_counter=self._count_tokens,
-                    ),
-                ],
+                middleware=middleware_list,
                 # 带上自定义 state，send_message_tool 靠 InjectedState
                 # 从这里取 plugin / event / user_msg
                 state_schema=ChatAgentState,
             )
+
+    async def _load_mcp_tools(self) -> list[BaseTool]:
+        """加载 exa MCP 搜索工具。
+
+        没配 EXA_API_KEY 或连接失败时返回空列表：插件照常加载，只是没有
+        搜索能力，不会因为 MCP 不可用整个插件起不来。
+        """
+        if not self.exa_key:
+            LOG.info("未配置 EXA_API_KEY，跳过 MCP 搜索工具加载")
+            return []
+        self.mcp_client = MultiServerMCPClient(
+            {
+                "exa": {
+                    "url": f"https://mcp.exa.ai/mcp?exaApiKey={self.exa_key}",
+                    "transport": "streamable_http",
+                }
+            }
+        )
+        try:
+            tools = await self.mcp_client.get_tools()
+        except Exception as e:  # noqa: BLE001 - 网络/协议错误都应降级为无搜索能力
+            LOG.warning("加载 exa MCP 搜索工具失败，本次不启用搜索: %s", e)
+            return []
+        LOG.info(
+            "已加载 %d 个 MCP 搜索工具: %s",
+            len(tools),
+            [tool.name for tool in tools],
+        )
+        return tools
 
     def get_now_time(self) -> SystemMessage:
         """获取当前时间，返回 SystemMessage 形式，供 LLM 使用"""
@@ -542,7 +606,7 @@ class AIPlugin(NcatBotPlugin):
             is_at_chat = SystemMessage(content="你被 @ 了，必须回复。")
         else:
             is_at_chat = SystemMessage(content="你没有被 @，可以选择不回复。")
-        system_chat = SystemMessage(content=SYSTEM_PROMPT)
+        system_chat = SystemMessage(content=self.system_prompt)
         user_chat = HumanMessage(content=user_chat_content)
 
         # system prompt + 工具定义 + 本轮用户消息是固定开销，先扣掉，
@@ -601,7 +665,7 @@ class AIPlugin(NcatBotPlugin):
                 # 用 token 预算而不是固定条数。
                 # 主动说话不按温度调节，用基准值（倍率 1.0）即可。
                 proactive_system = SystemMessage(
-                    content=SYSTEM_PROMPT
+                    content=self.system_prompt
                     + """\n[模式] 主动发起话题。不一定与记忆相关，也不一定与当前群聊的最新消息相关。
                     可以是一个问题、一个建议、一个有趣的想法、一个冷知识、一个笑话等。
                     注意，不要再重复之前的话题，也不要重复之前的消息内容。"""
@@ -697,8 +761,12 @@ class AIPlugin(NcatBotPlugin):
         「沉默」调用，保证这一轮仍然进历史。
         """
         messages = resp.get("messages", []) if isinstance(resp, dict) else []
+        # 被限流拦下的调用也会留一条 name=send_message 的 ToolMessage（status=error），
+        # 那种不算真的发过，仍要补一次沉默调用
         if any(
-            isinstance(msg, ToolMessage) and msg.name == SEND_MESSAGE_TOOL_NAME
+            isinstance(msg, ToolMessage)
+            and msg.name == SEND_MESSAGE_TOOL_NAME
+            and msg.status != "error"
             for msg in messages
         ):
             return

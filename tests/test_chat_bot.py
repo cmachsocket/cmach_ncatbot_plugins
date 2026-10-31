@@ -20,7 +20,7 @@ from langchain_core.messages import (
 )
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, tool
 from ncatbot.types import MessageArray
 from pydantic import Field
 
@@ -49,6 +49,9 @@ class _Query:
         if self.ptt_error is not None:
             raise self.ptt_error
         return SimpleNamespace(text=self.ptt_text)
+
+    async def get_login_info(self) -> Any:
+        return SimpleNamespace(user_id="999")
 
 
 class _QQ:
@@ -1006,3 +1009,256 @@ def test_patch_hindsight_run_async_works_inside_running_loop(monkeypatch) -> Non
 
 async def _async(value: Any) -> Any:
     return value
+
+
+# ---------- MCP 搜索工具 ----------
+
+
+@tool
+def fake_web_search(query: str) -> str:
+    """搜索网页。"""
+    return f"搜索结果: {query}"
+
+
+def test_load_mcp_tools_skips_without_key(caplog) -> None:
+    plugin = _plugin()
+    plugin.exa_key = ""
+
+    with caplog.at_level("INFO"):
+        tools = asyncio.run(plugin._load_mcp_tools())
+
+    assert tools == []
+    assert plugin.mcp_client is None
+    assert "跳过 MCP 搜索工具加载" in caplog.text
+
+
+def test_load_mcp_tools_returns_tools(monkeypatch, caplog) -> None:
+    plugin = _plugin()
+    plugin.exa_key = "key-123"
+    received: dict[str, Any] = {}
+
+    class _Client:
+        def __init__(self, connections: dict[str, Any]) -> None:
+            received["connections"] = connections
+
+        async def get_tools(self) -> list[BaseTool]:
+            return [fake_web_search]
+
+    monkeypatch.setattr(chat_module, "MultiServerMCPClient", _Client)
+
+    with caplog.at_level("INFO"):
+        tools = asyncio.run(plugin._load_mcp_tools())
+
+    assert [t.name for t in tools] == ["fake_web_search"]
+    assert "已加载 1 个 MCP 搜索工具" in caplog.text
+    connection = received["connections"]["exa"]
+    assert connection["url"] == "https://mcp.exa.ai/mcp?exaApiKey=key-123"
+    assert connection["transport"] == "streamable_http"
+
+
+def test_load_mcp_tools_degrades_when_server_unreachable(monkeypatch, caplog) -> None:
+    plugin = _plugin()
+    plugin.exa_key = "key-123"
+
+    class _Client:
+        def __init__(self, connections: dict[str, Any]) -> None:
+            pass
+
+        async def get_tools(self) -> list[BaseTool]:
+            raise RuntimeError("exa down")
+
+    monkeypatch.setattr(chat_module, "MultiServerMCPClient", _Client)
+
+    with caplog.at_level("WARNING"):
+        tools = asyncio.run(plugin._load_mcp_tools())
+
+    assert tools == []
+    assert "不启用搜索" in caplog.text
+
+
+def test_force_send_message_middleware_with_tools_never_names_send_message() -> None:
+    """有额外工具时只能要求「必须调某个工具」，指名会锁死搜索工具。"""
+    seen: list[Any] = []
+
+    async def handler(request: Any) -> Any:
+        seen.append(request.tool_choice)
+        return chat_module.ModelResponse(result=[AIMessage(content="ok")])
+
+    middleware = chat_module.ForceSendMessageMiddleware(
+        chat_module._FORCE_TOOL_CHOICES_WITH_TOOLS
+    )
+
+    asyncio.run(middleware.awrap_model_call(_model_request(), handler))
+
+    assert seen == ["required"]
+
+
+def _stub_on_load_deps(
+    monkeypatch: Any, plugin: chat_module.AIPlugin, config: dict[str, Any]
+) -> dict[str, Any]:
+    """把 on_load 的外部依赖换成假实现，返回 create_agent 收到的参数。"""
+    created: dict[str, Any] = {}
+
+    class _Temperature:
+        def __init__(self, token_base: int = 0) -> None:
+            self.token_base = token_base
+
+    def fake_create_agent(model: Any, **kwargs: Any) -> Any:
+        created["model"] = model
+        created.update(kwargs)
+        return "agent"
+
+    monkeypatch.setattr(chat_module, "TemperatureController", _Temperature)
+    monkeypatch.setattr(chat_module, "_patch_hindsight_run_async", lambda: None)
+    monkeypatch.setattr(
+        chat_module,
+        "hindsight_litellm",
+        SimpleNamespace(
+            configure=lambda **_: None,
+            set_defaults=lambda **_: None,
+            enable=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "get_config_manager",
+        lambda: SimpleNamespace(
+            get_adapter_config=lambda _: SimpleNamespace(
+                config={
+                    "completion_model": "test-model",
+                    "api_key": "key",
+                    "base_url": "http://localhost",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(chat_module, "create_agent", fake_create_agent)
+    plugin.config = config
+    return created
+
+
+def test_on_load_without_exa_key_does_not_crash(monkeypatch) -> None:
+    plugin = _plugin()
+    created = _stub_on_load_deps(
+        monkeypatch, plugin, {"EXA_API_KEY": "", "CONTEXT_TOKEN_BUDGET": 1024}
+    )
+
+    asyncio.run(plugin.on_load())
+
+    assert plugin.tools == []
+    assert [t.name for t in created["tools"]] == ["send_message"]
+    assert created["state_schema"] is chat_module.ChatAgentState
+    assert plugin.force_middleware is not None
+    assert plugin.force_middleware.choices == chat_module._FORCE_TOOL_CHOICES
+    assert chat_module.SEARCH_HINT not in plugin.system_prompt
+
+
+def test_on_load_with_exa_key_binds_search_tools(monkeypatch) -> None:
+    plugin = _plugin()
+    created = _stub_on_load_deps(
+        monkeypatch, plugin, {"EXA_API_KEY": "key-123", "CONTEXT_TOKEN_BUDGET": 1024}
+    )
+
+    async def fake_load() -> list[BaseTool]:
+        return [fake_web_search]
+
+    monkeypatch.setattr(plugin, "_load_mcp_tools", fake_load)
+
+    asyncio.run(plugin.on_load())
+
+    assert plugin.tools == [fake_web_search]
+    assert [t.name for t in created["tools"]] == ["send_message", "fake_web_search"]
+    assert plugin.force_middleware is not None
+    assert plugin.force_middleware.choices == chat_module._FORCE_TOOL_CHOICES_WITH_TOOLS
+    assert chat_module.SEARCH_HINT in plugin.system_prompt
+
+
+def test_agent_with_extra_tools_can_search_then_send(monkeypatch) -> None:
+    plugin = _plugin()
+    model = _ScriptedChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "fake_web_search",
+                        "args": {"query": "x"},
+                        "id": "call_1",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "send_message",
+                        "args": {"content": "回复", "reply": True},
+                        "id": "call_2",
+                    }
+                ],
+            ),
+        ]
+    )
+    middleware = chat_module.ForceSendMessageMiddleware(
+        chat_module._FORCE_TOOL_CHOICES_WITH_TOOLS
+    )
+    # 与 on_load 一样用 list[Any] 绕开 ToolCallLimitMiddleware 的 StateT 不变量问题
+    limiters: list[Any] = [
+        middleware,
+        chat_module.ToolCallLimitMiddleware(
+            tool_name="send_message", run_limit=1, exit_behavior="end"
+        ),
+        chat_module.ToolCallLimitMiddleware(
+            run_limit=chat_module._MAX_TOOL_CALLS_PER_RUN, exit_behavior="end"
+        ),
+    ]
+    plugin.agent = create_agent(
+        model,
+        tools=[chat_module.send_message_tool, fake_web_search],
+        middleware=limiters,
+        state_schema=chat_module.ChatAgentState,
+    )
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(chat_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(
+        plugin._run_agent(
+            [HumanMessage(content="hi")],
+            bank_id="u",
+            event=SimpleNamespace(group_id=555),
+            user_msg="Alice: hi",
+        )
+    )
+
+    # 先搜索、再发送：两轮都只要求「必须调某个工具」，消息照常发出
+    assert model.seen_tool_choice == ["required", "required"]
+    assert plugin.api.qq.texts == [(555, "回复")]  # type: ignore[union-attr]
+    assert plugin.assistent_messages[-1].content == "回复"
+
+
+def test_ensure_send_message_retries_when_previous_call_was_blocked() -> None:
+    """被限流拦下的 send_message 不算真的发过，仍要补一次沉默调用。"""
+    plugin = _plugin()
+    resp = {
+        "messages": [
+            AIMessage(content="x"),
+            ToolMessage(
+                content="Tool call limit exceeded.",
+                tool_call_id="1",
+                name="send_message",
+                status="error",
+            ),
+        ]
+    }
+
+    asyncio.run(
+        plugin._ensure_send_message(
+            resp, SimpleNamespace(group_id=555), "Alice: hi", None
+        )
+    )
+
+    assert plugin.api.qq.texts == []  # type: ignore[union-attr]
+    assert plugin.assistent_messages[-1].content == "...（已读未回）"
