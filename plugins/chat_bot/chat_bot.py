@@ -28,8 +28,9 @@ from langchain_core.messages import (
     convert_to_openai_messages,
     trim_messages,
 )
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, tool
 from langchain_litellm import ChatLiteLLM
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt.tool_node import InjectedState
 from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent
@@ -363,6 +364,9 @@ class AIPlugin(NcatBotPlugin):
     model: str
     api_key: str
     base_url: str
+    mcp_client: MultiServerMCPClient | None = None
+    exa_key: str = ""
+    tools: list[BaseTool]
     chat_llm: ChatLiteLLM | None = None
     agent: Any = None
     # 强制调用 send_message 的中间件，记住后端能接受哪种 tool_choice 写法
@@ -389,6 +393,8 @@ class AIPlugin(NcatBotPlugin):
         )
         self.hindsight_port = self.get_config("HINDSIGHT_PORT", 7071)
         self.target_group_id = self.get_config("TARGET_GROUP_ID", 1093424135)
+        self.exa_key = self.get_config("EXA_API_KEY", "")
+        
         # self.hindsight = Hindsight(base_url=f"http://localhost:{self.hindsight_port}")
         _patch_hindsight_run_async()
         hindsight_litellm.configure(
@@ -404,10 +410,21 @@ class AIPlugin(NcatBotPlugin):
         self._bg_task = asyncio.create_task(self._proactive_loop())
         manager = get_config_manager()
         ai_entry = manager.get_adapter_config("ai")
+        if self.exa_key:
+            self.mcp_client = MultiServerMCPClient(
+                {
+                    "exa": {
+                        "url": f"https://mcp.exa.ai/mcp?exaApiKey={self.exa_key}",
+                        "transport": "streamable_http",
+                    }
+                }
+            )
+            self.tools = await self.mcp_client.get_tools()
         if ai_entry:
             self.model = ai_entry.config.get("completion_model", "")
             self.api_key = ai_entry.config.get("api_key", "")
             self.base_url = ai_entry.config.get("base_url", "")
+           
             self.chat_llm = ChatLiteLLM(
                 model=self.model,
                 api_key=self.api_key,
@@ -429,7 +446,7 @@ class AIPlugin(NcatBotPlugin):
             self.force_middleware = ForceSendMessageMiddleware()
             self.agent = create_agent(
                 self.chat_llm,
-                tools=[send_message_tool],
+                tools=[send_message_tool, *self.tools],
                 middleware=[
                     # 放最外层：强制每次都调用 send_message 工具
                     self.force_middleware,
