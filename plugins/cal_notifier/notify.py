@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from enum import Enum
@@ -8,17 +9,29 @@ import recurring_ical_events
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from caldav import SynchronizableCalendarObjectCollection, aio
 from icalendar import Calendar
+from icalendar.cal import Component
 from icalendar.cal import Event as ICalEvent
+from icalendar.cal import Todo as ICalTodo
 from ncatbot.core import registrar
 from ncatbot.event.qq import PrivateMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 
-#: 通知作业 id 前缀，形如 caldav_notify:{uid}:{occurrence-id-iso}
+#: 通知作业 id 前缀，形如 caldav_notify:{component}:{uid}:{occurrence-id-iso}
 NOTIFY_JOB_PREFIX = "caldav_notify:"
+
+#: 日程组件名
+COMPONENT_EVENT = "VEVENT"
+
+#: 待办组件名
+COMPONENT_TODO = "VTODO"
+
+#: 会触发提醒的组件类型。其余（VJOURNAL / VFREEBUSY 等）直接忽略。
+NOTIFY_COMPONENTS = (COMPONENT_EVENT, COMPONENT_TODO)
 
 #: CalDAV 轮询周期（分钟）
 POLL_INTERVAL_MINUTES = 30
@@ -34,11 +47,17 @@ DEFAULT_ALL_DAY_NOTIFY_MINUTE = 30
 #: 缺少时区信息的事件（尤其全天事件）按这个时区解释
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 
+#: 待办固定时刻提醒的默认值：不提醒，由配置决定
+DEFAULT_TODO_NOTIFY_TIMES: tuple[tuple[int, int], ...] = ()
+
 #: 手动触发同步的命令名（含前缀，首 token 精确匹配）
 SYNC_COMMAND = "/sync_cal"
 
 #: 手动同步的超时秒数：CalDAV 服务器卡住时不至于把聊天命令挂死
 SYNC_TIMEOUT_SECONDS = 60
+
+#: 固定时刻汇总提醒的作业 id 前缀，形如 caldav_todo_daily:09:00
+DIGEST_JOB_PREFIX = "caldav_todo_daily:"
 
 
 class ChangeKind(Enum):
@@ -54,6 +73,63 @@ class Change:
     kind: ChangeKind
     # 完整 VCALENDAR：展开重复事件必须带上主事件 + 覆盖实例，不能拆开。
     calendar: Calendar | None = None
+    # 组件类型：VEVENT 走日程语义，VTODO 走待办语义（按 DUE 提醒）。
+    component: str = COMPONENT_EVENT
+
+
+@dataclass
+class TodoEntry:
+    """汇总提醒里的一条待办。"""
+
+    summary: str
+    #: 最近的截止/开始时刻，None 表示没有日期
+    due: datetime | None = None
+    all_day: bool = False
+    #: 时间的措辞：截止时间 / 开始时间
+    label: str = ""
+
+    def is_expired(self, now: datetime) -> bool:
+        """过了截止时间就不再进汇总；全天待办按当天结束算。"""
+        if self.due is None:
+            return False
+        end = self.due + timedelta(days=1) if self.all_day else self.due
+        return end <= now
+
+    def describe(self) -> str:
+        if self.due is None:
+            return f"{self.summary}（未设置日期）"
+        when = f"{self.due:%Y-%m-%d}" if self.all_day else f"{self.due:%Y-%m-%d %H:%M}"
+        return f"{self.summary}（{self.label} {when}）"
+
+
+def _owner_key(component: str, uid: str) -> str:
+    """作业归属键：组件类型 + UID。
+
+    带上前缀是因为 VEVENT 与 VTODO 可能撞 UID，而两者提醒语义不同，
+    不隔开就会互相取消对方的作业，把提醒吞掉。
+    """
+    return f"{component}:{uid}"
+
+
+def _primary_component(cal: Calendar) -> Component | None:
+    """取资源里的主组件（跳过 VTIMEZONE）。"""
+    for sub in cal.subcomponents:
+        name = str(getattr(sub, "name", ""))
+        if name and name != "VTIMEZONE":
+            return sub
+    return None
+
+
+def _todo_has_time(cal: Calendar) -> bool:
+    """待办必须自带 DTSTART 或 DUE 才排提醒。
+
+    纯清单型待办（两者都没有）很常见，而 recurring_ical_events 会给它们
+    合成 DTSTART=1970-01-01 / DUE=2038-01-01，展开后再判断已经晚了。
+    """
+    primary = _primary_component(cal)
+    if primary is None:
+        return False
+    return primary.get("DTSTART") is not None or primary.get("DUE") is not None
 
 
 class NotifyPlugin(NcatBotPlugin):
@@ -63,14 +139,16 @@ class NotifyPlugin(NcatBotPlugin):
     davclient: aio.AsyncDAVClient
     scheduler: AsyncIOScheduler
     sync_tokens: dict[str, str]  # {calendar_url: sync_token}
-    snapshot: dict[str, str]  # {对象绝对URL: uid}
+    snapshot: dict[str, tuple[str, str]]  # {对象绝对URL: (uid, 组件类型)}
     target_id: int
     notify_before_minutes: int
     notify_window_days: int
     all_day_notify_hour: int
     all_day_notify_minute: int
+    todo_notify_times: tuple[tuple[int, int], ...]
     tz: ZoneInfo
-    _jobs_by_uid: dict[str, set[str]]
+    _jobs_by_owner: dict[str, set[str]]
+    _todo_snapshot: dict[str, TodoEntry]
     _last_full_sync: datetime
     _sync_lock: asyncio.Lock
 
@@ -89,10 +167,14 @@ class NotifyPlugin(NcatBotPlugin):
         self.all_day_notify_minute = int(
             self.config.get("all_day_notify_minute", DEFAULT_ALL_DAY_NOTIFY_MINUTE)
         )
+        self.todo_notify_times = self._parse_notify_times(
+            self.config.get("todo_notify_times")
+        )
         self.tz = self._resolve_timezone(
             str(self.config.get("timezone", DEFAULT_TIMEZONE))
         )
-        self._jobs_by_uid = {}
+        self._jobs_by_owner = {}
+        self._todo_snapshot = {}
         # 手动 /sync_cal 与定时轮询共用这把锁，避免两者交错重排作业
         self._sync_lock = asyncio.Lock()
         # 启动后首轮就是全量（sync_tokens 为空），从加载时刻起算全量周期
@@ -127,10 +209,51 @@ class NotifyPlugin(NcatBotPlugin):
             # 而错过的提醒点又不补发，重启等于白等半个钟头。
             next_run_time=datetime.now(self.tz),
         )
+        # 每个时刻只挂一个汇总作业，待办多时才不会退化成 待办数 × 时刻数 个作业
+        for hour, minute in self.todo_notify_times:
+            hhmm = f"{hour:02d}:{minute:02d}"
+            self.scheduler.add_job(
+                self.send_todo_digest,
+                trigger=CronTrigger(hour=hour, minute=minute, timezone=self.tz),
+                args=[hhmm],
+                id=f"{DIGEST_JOB_PREFIX}{hhmm}",
+                replace_existing=True,
+            )
         self.scheduler.start()
         self.logger.info(
             f"{self.name} 已加载，提前 {self.notify_before_minutes} 分钟提醒"
         )
+
+    def _parse_notify_times(self, value: object) -> tuple[tuple[int, int], ...]:
+        """解析待办固定时刻提醒。
+
+        接受 YAML 列表（``["09:00", "20:00"]``）或逗号/空格分隔的字符串；
+        非法项记一条警告后跳过，不因为写错一个时刻就整段失效。
+        """
+        if value is None or value == "":
+            return DEFAULT_TODO_NOTIFY_TIMES
+        if isinstance(value, str):
+            raw = [item for item in value.replace(",", " ").split() if item]
+        elif isinstance(value, (list, tuple)):
+            raw = [str(item) for item in value]
+        else:
+            self.logger.warning(f"todo_notify_times 格式不对：{value!r}")
+            return DEFAULT_TODO_NOTIFY_TIMES
+
+        times: list[tuple[int, int]] = []
+        for item in raw:
+            try:
+                hour_text, minute_text = item.strip().split(":")
+                hour, minute = int(hour_text), int(minute_text)
+            except ValueError:
+                self.logger.warning(f"忽略无效的提醒时刻：{item!r}")
+                continue
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                self.logger.warning(f"忽略越界的提醒时刻：{item!r}")
+                continue
+            if (hour, minute) not in times:
+                times.append((hour, minute))
+        return tuple(times)
 
     def _resolve_timezone(self, name: str) -> ZoneInfo:
         try:
@@ -187,13 +310,15 @@ class NotifyPlugin(NcatBotPlugin):
                 href = str(obj.url.canonical())
                 seen.add(href)
 
-                # 快照存 {href: uid}，删除时用于反查需要取消的作业
+                # 快照存 {href: (uid, 组件类型)}，删除时用于反查需要取消的作业
                 if obj.data is None:
+                    uid, component = self.snapshot.pop(href, ("", COMPONENT_EVENT))
                     changes.append(
                         Change(
                             href=href,
                             kind=ChangeKind.DELETED,
-                            uid=self.snapshot.pop(href, ""),
+                            uid=uid,
+                            component=component,
                         )
                     )
                     continue
@@ -203,10 +328,25 @@ class NotifyPlugin(NcatBotPlugin):
                 cal = obj.get_icalendar_instance()
                 if not isinstance(cal, Calendar):
                     continue
+                primary = _primary_component(cal)
+                if primary is None:
+                    continue
+                # VEVENT 和 VTODO 的提醒语义不同，必须按组件类型分流
+                component = str(getattr(primary, "name", COMPONENT_EVENT))
+                if component not in NOTIFY_COMPONENTS:
+                    continue
                 kind = ChangeKind.UPDATED if href in self.snapshot else ChangeKind.ADDED
-                uid = str(obj.icalendar_component.get("UID") or "")
-                self.snapshot[href] = uid
-                changes.append(Change(href=href, kind=kind, calendar=cal, uid=uid))
+                uid = str(primary.get("UID") or "")
+                self.snapshot[href] = (uid, component)
+                changes.append(
+                    Change(
+                        href=href,
+                        kind=kind,
+                        calendar=cal,
+                        uid=uid,
+                        component=component,
+                    )
+                )
 
             # 全量同步不返回删除条目：拿"本次拉到的集合"和快照对账，
             # 否则上一轮之后被删掉的事件会带着已排的作业一直留着。
@@ -215,84 +355,158 @@ class NotifyPlugin(NcatBotPlugin):
                 for href in [h for h in self.snapshot if h.startswith(cal_url)]:
                     if href in seen:
                         continue
+                    uid, component = self.snapshot.pop(href, ("", COMPONENT_EVENT))
                     changes.append(
                         Change(
                             href=href,
                             kind=ChangeKind.DELETED,
-                            uid=self.snapshot.pop(href, ""),
+                            uid=uid,
+                            component=component,
                         )
                     )
         return changes
 
     # ---------- 通知调度 ----------
 
-    def _cancel_notifications(self, uid: str) -> None:
-        """撤掉某个 UID 下所有待发的通知作业。"""
-        for jid in self._jobs_by_uid.pop(uid, ()):
+    def _cancel_notifications(self, owner: str) -> None:
+        """撤掉某个归属键（组件类型 + UID）下所有待发的通知作业。"""
+        for jid in self._jobs_by_owner.pop(owner, ()):
             try:
                 self.scheduler.remove_job(jid)
             except JobLookupError:
                 pass
 
-    def _forget_job(self, uid: str, job_id: str) -> None:
+    def _forget_job(self, owner: str, job_id: str) -> None:
         """作业是一次性的：触发后 APScheduler 会删掉它，索引也得同步摘掉。"""
-        self._jobs_by_uid.get(uid, set()).discard(job_id)
+        self._jobs_by_owner.get(owner, set()).discard(job_id)
 
-    def _schedule_occurrence(self, occ: ICalEvent, now: datetime) -> None:
+    def _schedule_occurrence(
+        self, occ: Component, now: datetime, component: str
+    ) -> None:
         # 被取消的实例直接跳过
-        status = occ.get("STATUS")
-        if status is not None and str(status).upper() == "CANCELLED":
+        if self._is_cancelled(occ):
             return
 
-        dtstart = occ.get("DTSTART")
-        if dtstart is None:
-            return
-        raw = dtstart.dt
+        if component == COMPONENT_TODO:
+            if self._todo_is_done(occ):
+                return
+            anchor = self._todo_anchor(occ, now)
+            if anchor is None:
+                return
+            start, all_day, time_label, raw = anchor
+        else:
+            raw = self._raw_start(occ)
+            if raw is None:
+                return
+            time_label = "开始时间"
+            start = self._localize(raw, now)
+            if start is None:
+                return
+            all_day = not isinstance(raw, datetime)
 
-        # all_day 决定消息里怎么描述时间
-        if isinstance(raw, datetime):
-            # 定时事件：提前 notify_before_minutes 分钟提醒
-            start = raw
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=self.tz)
-            if start <= now:
-                return  # 已经开始了，不补发
-            notify_at = start - timedelta(minutes=self.notify_before_minutes)
-            all_day = False
-        elif isinstance(raw, date):
-            # 全天事件：前一天 all_day_notify_hour:minute 提醒
-            if raw < now.date():
-                return  # 已经过去了，不补发
-            start = datetime.combine(raw, time.min, tzinfo=self.tz)
+        # 定时：提前 notify_before_minutes 分钟提醒；全天：前一天固定时刻提醒
+        if all_day:
             notify_at = (start - timedelta(days=1)).replace(
                 hour=self.all_day_notify_hour, minute=self.all_day_notify_minute
             )
-            all_day = True
         else:
-            return
-
-        if notify_at <= now:
-            # 提醒点已过：插件刚启动 / 重启 / 通知点落在两轮轮询之间。
-            # 不补发——本插件唯一的恢复机制就是轮询本身；补发需要"已发送"状态，
-            # 而状态又需要持久化，会把 MemoryJobStore 的简化全部吐回去。
-            # 与 misfire_grace_time=300 的语义保持一致：错过就错过。
-            return
+            notify_at = start - timedelta(minutes=self.notify_before_minutes)
 
         uid = str(occ.get("UID") or "")
+        owner = _owner_key(component, uid)
         rid = occ.get("RECURRENCE-ID")
-        anchor = rid.dt if rid is not None else raw
-        job_id = f"{NOTIFY_JOB_PREFIX}{uid}:{anchor.isoformat()}"
+        anchor_dt = rid.dt if rid is not None else raw
 
         # 时间在这里就格式化好：作业参数不用再扛 ISO 串给运行时反解
-        when = f"{start:%Y-%m-%d} 全天" if all_day else f"{start:%Y-%m-%d %H:%M}"
+        if all_day:
+            when = (
+                f"{start:%Y-%m-%d}"
+                if component == COMPONENT_TODO
+                else f"{start:%Y-%m-%d} 全天"
+            )
+        else:
+            when = f"{start:%Y-%m-%d %H:%M}"
+
+        # 提醒点已过就不补发：插件唯一的恢复机制是轮询，补发需要"已发送"状态，
+        # 而状态又需要持久化，会把 MemoryJobStore 的简化全部吐回去。
+        # 与 misfire_grace_time=300 的语义一致：错过就错过。
+        if notify_at <= now:
+            return
+
+        job_id = f"{NOTIFY_JOB_PREFIX}{owner}:{anchor_dt.isoformat()}"
         self.scheduler.add_job(
             self.send_notification,
             trigger=DateTrigger(run_date=notify_at),
-            args=[str(occ.get("SUMMARY") or "(无标题)"), when, uid, job_id],
+            args=[
+                str(occ.get("SUMMARY") or "(无标题)"),
+                f"{time_label}：{when}",
+                owner,
+                job_id,
+            ],
             id=job_id,
             replace_existing=True,
         )
-        self._jobs_by_uid.setdefault(uid, set()).add(job_id)
+        self._jobs_by_owner.setdefault(owner, set()).add(job_id)
+
+    @staticmethod
+    def _raw_start(occ: Component) -> date | datetime | None:
+        dtstart = occ.get("DTSTART")
+        return dtstart.dt if dtstart is not None else None
+
+    def _localize(self, raw: object, now: datetime) -> datetime | None:
+        """把 ical 的时间值换算成带本地时区的 datetime；过去的值返回 None。"""
+        if isinstance(raw, datetime):
+            # UTC / 别的 TZID 一律换算到本地时区，消息里才不会出现 UTC 时间
+            start = (
+                raw.replace(tzinfo=self.tz)
+                if raw.tzinfo is None
+                else raw.astimezone(self.tz)
+            )
+            return None if start <= now else start
+        if isinstance(raw, date):
+            if raw < now.date():
+                return None
+            return datetime.combine(raw, time.min, tzinfo=self.tz)
+        return None
+
+    def _todo_anchor(
+        self, occ: Component, now: datetime
+    ) -> tuple[datetime, bool, str, date | datetime] | None:
+        """待办的锚点：(本地时刻, 是否全天, 措辞, 原始值)。
+
+        DUE 是截止时间，优先；没有 DUE 才退回 DTSTART。已经过去返回 None。
+        """
+        due = occ.get("DUE")
+        if due is not None:
+            raw, label = due.dt, "截止时间"
+        else:
+            raw = self._raw_start(occ)
+            if raw is None:
+                return None
+            label = "开始时间"
+        start = self._localize(raw, now)
+        if start is None:
+            return None
+        return start, not isinstance(raw, datetime), label, raw
+
+    @staticmethod
+    def _is_cancelled(occ: Component) -> bool:
+        status = occ.get("STATUS")
+        return status is not None and str(status).upper() == "CANCELLED"
+
+    @staticmethod
+    def _todo_is_done(occ: Component) -> bool:
+        """已完成的待办（STATUS:COMPLETED 或 PERCENT-COMPLETE:100）不再提醒。"""
+        status = occ.get("STATUS")
+        if status is not None and str(status).upper() == "COMPLETED":
+            return True
+        percent = occ.get("PERCENT-COMPLETE")
+        if percent is not None:
+            try:
+                return int(percent) >= 100
+            except TypeError, ValueError:
+                return False
+        return False
 
     async def notify_events(self, changes: list[Change]) -> None:
         now = datetime.now(self.tz)
@@ -300,39 +514,113 @@ class NotifyPlugin(NcatBotPlugin):
 
         for change in changes:
             if change.uid:
-                self._cancel_notifications(change.uid)
+                self._cancel_notifications(_owner_key(change.component, change.uid))
             if change.kind is ChangeKind.DELETED:
+                if change.component == COMPONENT_TODO:
+                    self._todo_snapshot.pop(change.uid, None)
                 continue
             if change.calendar is None:
                 continue
+            # 无 DTSTART/DUE 的待办没有一次性提醒可排，但固定时刻汇总里要有它
+            if change.component == COMPONENT_TODO and not _todo_has_time(
+                change.calendar
+            ):
+                self._record_undated_todo(change)
+                continue
 
             try:
-                # 用完整 Calendar 展开，自动处理 RRULE / EXDATE / 覆盖实例
-                occurrences = recurring_ical_events.of(change.calendar).between(
-                    now, horizon
-                )
+                # 用完整 Calendar 展开，自动处理 RRULE / EXDATE / 覆盖实例。
+                # components 必须显式给：默认只展开 VEVENT，待办会一条都出不来。
+                occurrences = recurring_ical_events.of(
+                    change.calendar, components=(change.component,)
+                ).between(now, horizon)
             except (KeyError, TypeError, ValueError) as exc:
                 self.logger.warning(f"展开事件失败 {change.href}: {exc}")
                 continue
 
+            occurrences = [
+                occ for occ in occurrences if isinstance(occ, (ICalEvent, ICalTodo))
+            ]
+            if change.component == COMPONENT_TODO:
+                self._record_todo(change.uid, occurrences, now)
             for occ in occurrences:
-                # between() 静态返回 list[Component]，运行时是 VEVENT，这里收窄。
-                if not isinstance(occ, ICalEvent):
-                    continue
-                self._schedule_occurrence(occ, now)
+                self._schedule_occurrence(occ, now, change.component)
+
+    def _record_undated_todo(self, change: Change) -> None:
+        """把无日期的待办记进汇总清单；已完成/已取消的踢掉。"""
+        primary = _primary_component(change.calendar) if change.calendar else None
+        if (
+            primary is None
+            or self._todo_is_done(primary)
+            or self._is_cancelled(primary)
+        ):
+            self._todo_snapshot.pop(change.uid, None)
+            return
+        self._todo_snapshot[change.uid] = TodoEntry(
+            str(primary.get("SUMMARY") or "(无标题)")
+        )
+
+    def _record_todo(
+        self, uid: str, occurrences: Sequence[Component], now: datetime
+    ) -> None:
+        """重复待办只保留最近一次实例的时间，供固定时刻汇总使用。"""
+        for occ in occurrences:
+            if self._todo_is_done(occ) or self._is_cancelled(occ):
+                continue
+            anchor = self._todo_anchor(occ, now)
+            if anchor is None:
+                continue
+            start, all_day, label, _ = anchor
+            self._todo_snapshot[uid] = TodoEntry(
+                str(occ.get("SUMMARY") or "(无标题)"),
+                due=start,
+                all_day=all_day,
+                label=label,
+            )
+            return
+        # 没有未完成且未过期的实例：不再进汇总
+        self._todo_snapshot.pop(uid, None)
+
+    async def send_todo_digest(self, hhmm: str) -> None:
+        """固定时刻提醒：把当前该提醒的待办汇总成一条消息发出去。"""
+        if self.target_id == 0:
+            self.logger.error("未配置 target_id，无法发送待办提醒")
+            return
+        now = datetime.now(self.tz)
+        for uid in [
+            uid for uid, entry in self._todo_snapshot.items() if entry.is_expired(now)
+        ]:
+            del self._todo_snapshot[uid]
+
+        entries = sorted(
+            self._todo_snapshot.values(),
+            key=lambda entry: (entry.due is None, entry.due or now),
+        )
+        if not entries:
+            return
+        lines = "\n".join(f"· {entry.describe()}" for entry in entries)
+        await self.api.qq.post_private_msg(
+            self.target_id, text=f"待办提醒（{hhmm}）\n{lines}"
+        )
+        self.logger.info(f"已发送待办提醒（{hhmm}）：{len(entries)} 条")
 
     async def send_notification(
-        self, summary: str, when: str, uid: str, job_id: str
+        self, summary: str, body: str, owner: str, job_id: str
     ) -> None:
         try:
             if self.target_id == 0:
                 self.logger.error("未配置 target_id，无法发送日程提醒")
                 return
-            text = f"日程提醒：{summary}\n开始时间：{when}"
-            await self.api.qq.post_private_msg(self.target_id, text=text)
-            self.logger.info(f"已发送日程提醒：{summary} @ {when}")
+            label = (
+                "待办提醒" if owner.split(":", 1)[0] == COMPONENT_TODO else "日程提醒"
+            )
+            await self.api.qq.post_private_msg(
+                self.target_id, text=f"{label}：{summary}\n{body}"
+            )
+            self.logger.info(f"已发送{label}：{summary} @ {body}")
         finally:
-            self._forget_job(uid, job_id)
+            # 作业是一次性的，触发后 APScheduler 会删掉它，索引也同步摘掉
+            self._forget_job(owner, job_id)
 
     async def _scheduled_poll(self) -> None:
         """定时任务入口：拿锁跑一次普通轮询。"""
@@ -371,7 +659,7 @@ class NotifyPlugin(NcatBotPlugin):
         return len(changes), self._pending_job_count()
 
     def _pending_job_count(self) -> int:
-        return sum(len(jids) for jids in self._jobs_by_uid.values())
+        return sum(len(jids) for jids in self._jobs_by_owner.values())
 
     # ---------- 聊天命令 ----------
 
